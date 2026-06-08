@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "309430069691",
+    "project_id": "sadman-b88e2",
+    "storage_bucket": "sadman-b88e2.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:309430069691:android:12f8b23ad76abbb9bcbc9e",
+        "android_client_info": {
+          "package_name": "com.sadmantm.decay"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCJnA6eviWZth-LU36_usBNS2UM-GMMpW8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:309430069691:android:5534c791c6727b8bbcbc9e",
+        "android_client_info": {
+          "package_name": "webviewgold.nargas"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCJnA6eviWZth-LU36_usBNS2UM-GMMpW8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
