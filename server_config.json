@@ -1,0 +1,18 @@
+{
+    "ServerId": "550e8400-e29b-41d4-a716-446655440000",
+    "NomeDoServidor": "Brasil Nordeste v2",
+    "DescricaoServidor": "Servidor brasileiro PvP/PvE",
+    "DiscordUrl": "",
+    "IPDoServidor": "52.67.66.140",
+    "Porta": 7777,
+    "Regiao": "BR",
+    "MasterBaseUrl": "http://52.67.66.140:3000",
+    "ServerKey": "your-secret-server-key-change-in-production",
+    "MaxPlayers": 50,
+    "MapId": "island_v2",
+    "BuildVersion": "0.1.0",
+    "TipoServidor": 0,
+    "BalanceamentoArmaduras": 1.0,
+    "MultiplicadorDeColetas": 1.0,
+    "ItensConfig": []
+}

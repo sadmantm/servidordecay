@@ -1,0 +1,14 @@
+# 1. Ajuste o caminho em decay-server.service e copie
+sudo cp decay-server.service /etc/systemd/system/
+
+# 2. Recarregue o systemd
+sudo systemctl daemon-reload
+
+# 3. Habilite para iniciar com o sistema
+sudo systemctl enable decay-server
+
+# 4. Inicie agora
+sudo systemctl start decay-server
+
+# 5. Acompanhe os logs em tempo real
+journalctl -u decay-server -f
