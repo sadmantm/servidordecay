@@ -5,8 +5,8 @@ After=network.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/home/ubuntu/servidordecay
-ExecStart=/home/ubuntu/servidordecay/start_server.sh
+WorkingDirectory=/home/ubuntu/servidor
+ExecStart=/home/ubuntu/servidor/start_server.sh
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
