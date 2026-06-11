@@ -1,21 +1,31 @@
 [Unit]
 Description=Decay Dedicated Server
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/home/ubuntu/servidor
-ExecStart=/home/ubuntu/servidor/start_server.sh
-Restart=on-failure
-RestartSec=10
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/servidordecay
+ExecStart=/home/ubuntu/servidordecay/start_server.sh
+
+# Reinício automático em qualquer saída (crash, kill, etc.)
+Restart=always
+RestartSec=5
+
+# Evita "rajada" de reinícios: no máx. 10 partidas em 60s,
+# senão o systemd pausa o serviço (equivale ao seu PAUSE_ON_CRASH).
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+# Encerramento limpo: envia SIGTERM (seu trap no script trata) e dá tempo.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Logs vão para o journald (journalctl -u decay-server -f)
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=decay-server
-
-# Limites de recursos
-LimitNOFILE=65536
-LimitNPROC=4096
 
 [Install]
 WantedBy=multi-user.target
