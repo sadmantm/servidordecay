@@ -8,7 +8,7 @@
 #
 #  O servidor roda sob systemd (24/7, boot, restart em crash).
 #  Este hub é o painel de controle: instalar, iniciar, parar,
-#  reiniciar, status, logs e console ao vivo (enviar comandos).
+#  reiniciar, status, logs, console ao vivo e monitor de recursos.
 # ============================================================
 
 set -u
@@ -112,6 +112,47 @@ status_curto() {
     else
         echo -e "${RED}✘ NÃO INSTALADO${NC}"
     fi
+}
+
+# ── PID do processo do JOGO (o executável Unity, não o wrapper) ─
+# O MainPID do systemd aponta para o decayhub.sh __run; o executável
+# real é filho dele. Aqui resolvemos o PID do próprio APP_NAME.
+pid_do_servidor() {
+    pgrep -f "$APP_NAME" | head -n1
+}
+
+# ── Barra de progresso colorida para porcentagens ───────────
+barra_pct() {
+    # $1 = valor (0-100, pode ter decimal); $2 = largura (default 20)
+    local pct=${1%.*}; local largura=${2:-20}
+    [[ -z "$pct" ]] && pct=0
+    (( pct > 100 )) && pct=100
+    (( pct < 0 )) && pct=0
+    local cheio=$(( pct * largura / 100 ))
+    local vazio=$(( largura - cheio ))
+    local cor=$GREEN
+    (( pct >= 75 )) && cor=$YELLOW
+    (( pct >= 90 )) && cor=$RED
+    local b=""
+    local i
+    for ((i=0; i<cheio; i++)); do b+="█"; done
+    for ((i=0; i<vazio; i++)); do b+="░"; done
+    echo -e "${cor}${b}${NC}"
+}
+
+# ── Linha de resumo curta (usada no topo do menu) ───────────
+resumo_recursos() {
+    local pid; pid=$(pid_do_servidor)
+    if [[ -z "$pid" ]]; then
+        echo -e "  ${YELLOW}(sem processo do jogo para medir)${NC}"
+        return
+    fi
+    # %CPU e %MEM do processo via ps; RAM residente em MB
+    local cpu mem rss
+    read -r cpu mem rss < <(ps -p "$pid" -o %cpu=,%mem=,rss= 2>/dev/null)
+    [[ -z "$cpu" ]] && { echo -e "  ${YELLOW}(processo encerrou durante a leitura)${NC}"; return; }
+    local rss_mb=$(( ${rss:-0} / 1024 ))
+    echo -e "  Jogo: ${BOLD}CPU ${cpu}%${NC}  ·  ${BOLD}RAM ${mem}% (${rss_mb} MB)${NC}  ·  PID ${pid}"
 }
 
 # ── 1. Instalar / ajustar permissões + serviço ──────────────
@@ -252,6 +293,162 @@ acao_console() {
     trap - SIGINT
 }
 
+# ── 8. Monitor de recursos (CPU / RAM / Disco / Rede) ───────
+# Mostra um snapshot do processo do jogo e da máquina.
+# Opção de modo "ao vivo" que atualiza a cada 2s.
+acao_monitor() {
+    echo ""
+    echo -e "  Atualizar continuamente (ao vivo) ou só um snapshot?"
+    echo -e "    ${GREEN}l${NC}) ao vivo (atualiza a cada 2s, Ctrl+C para sair)"
+    echo -e "    ${GREEN}s${NC}) snapshot único"
+    read -r -p "  Escolha [s]: " modo
+    modo=${modo:-s}
+
+    if [[ "$modo" == "l" || "$modo" == "L" ]]; then
+        trap 'echo; return' SIGINT
+        while true; do
+            clear
+            render_monitor
+            echo ""
+            echo -e "  ${YELLOW}Atualizando a cada 2s — Ctrl+C para voltar ao menu.${NC}"
+            sleep 2
+        done
+        trap - SIGINT
+    else
+        echo ""
+        render_monitor
+        pausar
+    fi
+}
+
+# Desenha o painel de métricas (uma "tela").
+render_monitor() {
+    echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║        MONITOR DE RECURSOS · DECAY         ║${NC}"
+    echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
+    echo -e "  ${CYAN}$(date '+%F %T')${NC}   ·   Estado: $(status_curto)"
+    echo ""
+
+    # ── PROCESSO DO JOGO ─────────────────────────────────────
+    echo -e "${BOLD}── Processo do servidor (Unity) ──────────────${NC}"
+    local pid; pid=$(pid_do_servidor)
+    if [[ -z "$pid" ]]; then
+        warn "Nenhum processo '$APP_NAME' em execução."
+    else
+        local cpu mem rss nlwp etime
+        read -r cpu mem rss nlwp etime < <(ps -p "$pid" -o %cpu=,%mem=,rss=,nlwp=,etime= 2>/dev/null)
+        if [[ -z "$cpu" ]]; then
+            warn "Processo encerrou durante a leitura."
+        else
+            local rss_mb=$(( ${rss:-0} / 1024 ))
+            printf "  PID............: %s\n" "$pid"
+            printf "  Uptime.........: %s\n" "${etime// /}"
+            printf "  Threads........: %s\n" "$nlwp"
+            printf "  CPU............: %5s%%  %b\n" "$cpu" "$(barra_pct "$cpu")"
+            printf "  RAM (residente): %s MB (%s%% do total)  %b\n" "$rss_mb" "$mem" "$(barra_pct "$mem")"
+        fi
+    fi
+    echo ""
+
+    # ── MÁQUINA: CPU ─────────────────────────────────────────
+    echo -e "${BOLD}── Máquina ───────────────────────────────────${NC}"
+    local ncpu; ncpu=$(nproc 2>/dev/null || echo "?")
+    local load; load=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)
+    printf "  Núcleos........: %s\n" "$ncpu"
+    printf "  Load (1/5/15m).: %s\n" "$load"
+
+    # Uso de CPU agregado (amostra de 1s do /proc/stat)
+    local cpu_uso
+    cpu_uso=$(uso_cpu_total)
+    printf "  CPU total......: %5s%%  %b\n" "$cpu_uso" "$(barra_pct "$cpu_uso")"
+
+    # ── MÁQUINA: RAM / SWAP ──────────────────────────────────
+    # Lê de /proc/meminfo para não depender do formato do `free`.
+    local mem_total mem_avail mem_usado_pct swap_total swap_free swap_usado_pct
+    mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+    mem_avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+    swap_total=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)
+    swap_free=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
+
+    local mem_usado=$(( mem_total - mem_avail ))
+    if (( mem_total > 0 )); then
+        mem_usado_pct=$(( mem_usado * 100 / mem_total ))
+    else
+        mem_usado_pct=0
+    fi
+    printf "  RAM............: %s / %s MB (%s%%)  %b\n" \
+        "$(( mem_usado / 1024 ))" "$(( mem_total / 1024 ))" "$mem_usado_pct" \
+        "$(barra_pct "$mem_usado_pct")"
+
+    if (( swap_total > 0 )); then
+        local swap_usado=$(( swap_total - swap_free ))
+        swap_usado_pct=$(( swap_usado * 100 / swap_total ))
+        printf "  Swap...........: %s / %s MB (%s%%)  %b\n" \
+            "$(( swap_usado / 1024 ))" "$(( swap_total / 1024 ))" "$swap_usado_pct" \
+            "$(barra_pct "$swap_usado_pct")"
+    else
+        printf "  Swap...........: (desativado)\n"
+    fi
+
+    # ── MÁQUINA: DISCO ───────────────────────────────────────
+    # Uso do disco onde fica o servidor.
+    local disco
+    disco=$(df -h --output=used,size,pcent "$SERVER_DIR" 2>/dev/null | tail -n1)
+    if [[ -n "$disco" ]]; then
+        local d_used d_size d_pct
+        read -r d_used d_size d_pct <<< "$disco"
+        printf "  Disco (%s): %s / %s (%s)  %b\n" \
+            "$SERVER_DIR" "$d_used" "$d_size" "$d_pct" "$(barra_pct "${d_pct%\%}")"
+    fi
+
+    # Tamanho da pasta de logs (ajuda a flagrar log crescendo demais)
+    if [[ -d "$LOG_DIR" ]]; then
+        local logsz; logsz=$(du -sh "$LOG_DIR" 2>/dev/null | cut -f1)
+        printf "  Pasta de logs..: %s\n" "${logsz:-?}"
+    fi
+
+    # ── MÁQUINA: REDE ────────────────────────────────────────
+    # Total acumulado RX/TX desde o boot, somando interfaces físicas.
+    local rede
+    rede=$(rede_total)
+    printf "  Rede (acum.)...: %s\n" "$rede"
+}
+
+# Uso de CPU total em % a partir de duas amostras do /proc/stat.
+uso_cpu_total() {
+    local a b idle_a idle_b total_a total_b
+    a=($(awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8}' /proc/stat))
+    idle_a=${a[3]}
+    total_a=0; for v in "${a[@]}"; do total_a=$(( total_a + v )); done
+    sleep 1
+    b=($(awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8}' /proc/stat))
+    idle_b=${b[3]}
+    total_b=0; for v in "${b[@]}"; do total_b=$(( total_b + v )); done
+
+    local d_total=$(( total_b - total_a ))
+    local d_idle=$(( idle_b - idle_a ))
+    if (( d_total > 0 )); then
+        echo $(( (d_total - d_idle) * 100 / d_total ))
+    else
+        echo 0
+    fi
+}
+
+# Soma RX/TX (em MB/GB) das interfaces, ignorando loopback.
+rede_total() {
+    local rx_total=0 tx_total=0 iface rx tx
+    while read -r iface rx tx; do
+        [[ "$iface" == "lo" ]] && continue
+        rx_total=$(( rx_total + rx ))
+        tx_total=$(( tx_total + tx ))
+    done < <(awk -F'[: ]+' 'NR>2 {print $2, $3, $11}' /proc/net/dev)
+
+    # bytes → MB
+    local rx_mb=$(( rx_total / 1024 / 1024 ))
+    local tx_mb=$(( tx_total / 1024 / 1024 ))
+    echo "↓ ${rx_mb} MB  ·  ↑ ${tx_mb} MB"
+}
+
 pausar() {
     echo ""
     read -r -p "Pressione ENTER para continuar..."
@@ -267,6 +464,10 @@ menu() {
         echo -e "${BOLD}${CYAN}║          DECAY · PAINEL DO SERVIDOR        ║${NC}"
         echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
         echo -e "  Estado: $(status_curto)"
+        # Resumo rápido de CPU/RAM do jogo, só quando está rodando.
+        if esta_rodando; then
+            resumo_recursos
+        fi
         echo ""
         echo "  1) Instalar / ajustar permissões"
         echo "  2) Iniciar servidor (segundo plano)"
@@ -275,6 +476,7 @@ menu() {
         echo "  5) Status detalhado"
         echo "  6) Acompanhar logs (ao vivo)"
         echo "  7) Console — enviar comandos"
+        echo "  8) Monitor de recursos (CPU/RAM/disco/rede)"
         echo "  0) Sair do painel (servidor continua rodando)"
         echo ""
         read -r -p "  Escolha: " opt
@@ -287,6 +489,7 @@ menu() {
             5) acao_status ;;
             6) acao_logs ;;
             7) acao_console ;;
+            8) acao_monitor ;;
             0) echo "Saindo. O servidor continua rodando em segundo plano."; exit 0 ;;
             *) warn "Opção inválida."; sleep 1 ;;
         esac
