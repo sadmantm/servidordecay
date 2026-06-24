@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/home/ubuntu/servidordecay
-ExecStart=/home/ubuntu/servidordecay/start_server.sh
+User=matheus
+Group=matheus
+WorkingDirectory=/home/matheus/servidordecay
+ExecStart=/home/matheus/servidordecay/start_server.sh
 
 # Reinício automático em qualquer saída (crash, kill, etc.)
 Restart=always
