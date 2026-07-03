@@ -1,6 +1,6 @@
 {
     "ServerId": "550e8400-e29b-41d4-a716-446655440000",
-    "NomeDoServidor": "Brasil Nordeste v2",
+    "NomeDoServidor": "Brasil MOBILE [DUO]",
     "DescricaoServidor": "Servidor brasileiro PvP/PvE",
     "DiscordUrl": "",
     "IPDoServidor": "131.108.214.0",
@@ -9,10 +9,12 @@
     "MasterBaseUrl": "http://52.67.66.140:3000",
     "ServerKey": "your-secret-server-key-change-in-production",
     "MaxPlayers": 50,
-    "MapId": "island_v2",
+    "MapId": "island_v1",
     "BuildVersion": "0.1.0",
     "TipoServidor": 0,
+"LimiteDeTime": Duo,
     "BalanceamentoArmaduras": 1.0,
     "MultiplicadorDeColetas": 1.0,
-    "ItensConfig": []
+    "PlataformasPermitidas": "Mobile",
+    "JogadoresBanidos": []
 }
