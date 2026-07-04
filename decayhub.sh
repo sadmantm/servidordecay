@@ -163,6 +163,69 @@ resumo_recursos() {
     echo -e "  Jogo: ${BOLD}CPU ${cpu}%${NC}  ·  ${BOLD}RAM ${mem}% (${rss_mb} MB)${NC}  ·  PID ${pid}"
 }
 
+# ── Cria/garante um swapfile de 2GB (idempotente) ───────────
+SWAP_FILE="/swapfile_decay"
+SWAP_SIZE_MB=2048
+
+acao_criar_swap() {
+    local SUDO; SUDO=$(precisa_sudo)
+
+    if swapon --show 2>/dev/null | grep -q .; then
+        ok "Já existe swap ativo no sistema — pulando criação."
+        swapon --show
+        return 0
+    fi
+
+    if [[ -f "$SWAP_FILE" ]]; then
+        warn "Arquivo de swap já existe ($SWAP_FILE) mas não está ativo. Reativando..."
+        $SUDO chmod 600 "$SWAP_FILE"
+        $SUDO swapon "$SWAP_FILE" 2>/dev/null && { ok "Swap reativado."; return 0; }
+        warn "Falhou ao reativar arquivo existente — recriando do zero."
+        $SUDO swapoff "$SWAP_FILE" 2>/dev/null
+        $SUDO rm -f "$SWAP_FILE"
+    fi
+
+    local disco_livre_mb
+    disco_livre_mb=$(df --output=avail -m "$(dirname "$SWAP_FILE")" 2>/dev/null | tail -n1 | tr -d ' ')
+    if [[ -z "$disco_livre_mb" ]] || (( disco_livre_mb < SWAP_SIZE_MB + 512 )); then
+        err "Espaço insuficiente para criar swap de ${SWAP_SIZE_MB}MB (livre: ${disco_livre_mb:-?}MB)."
+        warn "Pulando criação de swap. Libere espaço e rode a instalação novamente se necessário."
+        return 1
+    fi
+
+    log "Criando arquivo de swap de ${SWAP_SIZE_MB}MB em $SWAP_FILE..."
+    if ! $SUDO fallocate -l "${SWAP_SIZE_MB}M" "$SWAP_FILE" 2>/dev/null; then
+        warn "fallocate falhou (filesystem pode não suportar) — usando dd, pode demorar mais..."
+        $SUDO dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$SWAP_SIZE_MB" status=progress
+    fi
+
+    log "Ajustando permissões (600)..."
+    $SUDO chmod 600 "$SWAP_FILE"
+
+    log "Formatando como swap..."
+    if ! $SUDO mkswap "$SWAP_FILE" >/dev/null; then
+        err "mkswap falhou. Abortando criação de swap."
+        $SUDO rm -f "$SWAP_FILE"
+        return 1
+    fi
+
+    log "Ativando swap..."
+    if ! $SUDO swapon "$SWAP_FILE"; then
+        err "swapon falhou. Verifique se o filesystem suporta swapfiles (ex.: btrfs precisa de tratamento especial)."
+        return 1
+    fi
+
+    if ! grep -qF "$SWAP_FILE" /etc/fstab 2>/dev/null; then
+        log "Adicionando entrada ao /etc/fstab..."
+        echo "$SWAP_FILE none swap sw 0 0" | $SUDO tee -a /etc/fstab >/dev/null
+    else
+        log "Entrada do swap já existe no /etc/fstab — não duplicando."
+    fi
+
+    ok "Swap de ${SWAP_SIZE_MB}MB criado e ativado."
+    free -h | grep -i swap
+}
+
 # ── 1. Instalar / ajustar permissões + serviço ──────────────
 acao_instalar() {
     local SUDO; SUDO=$(precisa_sudo)
@@ -181,9 +244,9 @@ acao_instalar() {
     mkdir -p "$LOG_DIR"
     chmod 755 "$LOG_DIR"
 
+    acao_criar_swap
+
     log "Instalando unit do systemd..."
-    # Gera a unit apontando para este próprio arquivo em modo __run.
-    # Os caminhos são os detectados agora — funciona em qualquer diretório.
     $SUDO tee "$UNIT_PATH" >/dev/null <<EOF
 [Unit]
 Description=Decay Dedicated Server
