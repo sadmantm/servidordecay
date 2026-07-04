@@ -9,23 +9,35 @@
 #  O servidor roda sob systemd (24/7, boot, restart em crash).
 #  Este hub é o painel de controle: instalar, iniciar, parar,
 #  reiniciar, status, logs, console ao vivo e monitor de recursos.
+#
+#  NOTA: este arquivo é autossuficiente. Ele gera a própria unit do
+#  systemd (ExecStart=... __run) e é o próprio lançador. Não depende
+#  de start_server.sh nem de um .service externo — ambos são legados
+#  e podem ser removidos.
 # ============================================================
 
 set -u
 
-# ── Configuração ────────────────────────────────────────────
-SERVER_DIR="/home/ubuntu/servidordecay"
-USER_OWNER="ubuntu"
-GROUP_OWNER="ubuntu"
+# ── Configuração AUTODETECTADA ──────────────────────────────
+# O diretório do servidor é a pasta ONDE ESTE SCRIPT ESTÁ.
+# Assim cada máquina/instância funciona sem editar caminhos à mão.
+SERVER_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+# Dono/grupo inferidos do dono real da pasta do servidor (não fixa "ubuntu").
+# Fallback para o usuário atual se o stat falhar.
+USER_OWNER="$(stat -c '%U' "$SERVER_DIR" 2>/dev/null || id -un)"
+GROUP_OWNER="$(stat -c '%G' "$SERVER_DIR" 2>/dev/null || id -gn)"
+
 APP_NAME="decay.x86_64"
 SERVICE_NAME="decay-server"
 
 APP="$SERVER_DIR/$APP_NAME"
 LOG_DIR="$SERVER_DIR/logs"
 IN_FIFO="$SERVER_DIR/.server_in.fifo"
-SELF="$SERVER_DIR/$(basename "$0")"
+SELF="$(readlink -f "$0")"
 UNIT_PATH="/etc/systemd/system/$SERVICE_NAME.service"
 MAX_LOGS=14
+TMUX_SESSION="decay_console"
 
 # ── Cores ───────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -115,15 +127,12 @@ status_curto() {
 }
 
 # ── PID do processo do JOGO (o executável Unity, não o wrapper) ─
-# O MainPID do systemd aponta para o decayhub.sh __run; o executável
-# real é filho dele. Aqui resolvemos o PID do próprio APP_NAME.
 pid_do_servidor() {
     pgrep -f "$APP_NAME" | head -n1
 }
 
 # ── Barra de progresso colorida para porcentagens ───────────
 barra_pct() {
-    # $1 = valor (0-100, pode ter decimal); $2 = largura (default 20)
     local pct=${1%.*}; local largura=${2:-20}
     [[ -z "$pct" ]] && pct=0
     (( pct > 100 )) && pct=100
@@ -147,7 +156,6 @@ resumo_recursos() {
         echo -e "  ${YELLOW}(sem processo do jogo para medir)${NC}"
         return
     fi
-    # %CPU e %MEM do processo via ps; RAM residente em MB
     local cpu mem rss
     read -r cpu mem rss < <(ps -p "$pid" -o %cpu=,%mem=,rss= 2>/dev/null)
     [[ -z "$cpu" ]] && { echo -e "  ${YELLOW}(processo encerrou durante a leitura)${NC}"; return; }
@@ -158,6 +166,9 @@ resumo_recursos() {
 # ── 1. Instalar / ajustar permissões + serviço ──────────────
 acao_instalar() {
     local SUDO; SUDO=$(precisa_sudo)
+
+    log "Diretório detectado: $SERVER_DIR"
+    log "Dono/grupo: $USER_OWNER:$GROUP_OWNER"
 
     log "Ajustando dono para $USER_OWNER:$GROUP_OWNER..."
     $SUDO chown -R "$USER_OWNER:$GROUP_OWNER" "$SERVER_DIR"
@@ -172,6 +183,7 @@ acao_instalar() {
 
     log "Instalando unit do systemd..."
     # Gera a unit apontando para este próprio arquivo em modo __run.
+    # Os caminhos são os detectados agora — funciona em qualquer diretório.
     $SUDO tee "$UNIT_PATH" >/dev/null <<EOF
 [Unit]
 Description=Decay Dedicated Server
@@ -255,13 +267,24 @@ acao_logs() {
     echo ""
     log "Logs ao vivo (Ctrl+C para voltar ao menu)."
     echo ""
-    # Ctrl+C aqui só interrompe o journalctl, não o hub.
     trap ' ' SIGINT
     journalctl -u "$SERVICE_NAME" -f --no-pager
     trap - SIGINT
 }
 
-# ── 7. Console ao vivo (enviar comandos) ────────────────────
+# ── Envia UM comando para o servidor via FIFO ───────────────
+# Usado tanto pelo console simples quanto pelo painel tmux.
+enviar_comando() {
+    local linha="$1"
+    [[ -z "$linha" ]] && return 1
+    if [[ ! -p "$IN_FIFO" ]]; then
+        return 2
+    fi
+    echo "$linha" > "$IN_FIFO"
+    return 0
+}
+
+# ── 7. Console simples (só escrita, fallback sem tmux) ──────
 acao_console() {
     if ! esta_rodando; then
         warn "O servidor não está rodando — inicie-o antes de usar o console."
@@ -279,7 +302,7 @@ acao_console() {
     echo -e "${BOLD}Console do servidor${NC} — digite comandos e ENTER."
     echo -e "Ex.: ${GREEN}adminset Joao true${NC}, ${GREEN}players${NC}"
     echo -e "Digite ${YELLOW}sair${NC} (ou Ctrl+C) para voltar ao menu."
-    echo -e "Dica: abra os logs em outro terminal para ver a resposta."
+    echo -e "Dica: para ver os logs ao mesmo tempo, use a opção 8 (tmux)."
     echo ""
 
     trap 'echo; return' SIGINT
@@ -287,15 +310,91 @@ acao_console() {
         read -r -p "decay> " linha || break
         [[ "$linha" == "sair" || "$linha" == "exit" ]] && break
         [[ -z "$linha" ]] && continue
-        echo "$linha" > "$IN_FIFO"
+        enviar_comando "$linha"
         echo -e "${CYAN}→ enviado:${NC} $linha"
     done
     trap - SIGINT
 }
 
-# ── 8. Monitor de recursos (CPU / RAM / Disco / Rede) ───────
-# Mostra um snapshot do processo do jogo e da máquina.
-# Opção de modo "ao vivo" que atualiza a cada 2s.
+# ── 8. Console + Logs juntos (tmux) ─────────────────────────
+# Abre uma sessão tmux dividida:
+#   painel de CIMA  → journalctl -f (logs ao vivo)
+#   painel de BAIXO → prompt que envia comandos para a FIFO
+# Desanexar: Ctrl+B depois D  (o servidor continua rodando).
+acao_console_tmux() {
+    if ! command -v tmux >/dev/null 2>&1; then
+        err "tmux não está instalado."
+        echo -e "  Instale com: ${GREEN}sudo apt install tmux${NC}"
+        echo -e "  Enquanto isso, use a opção 7 (console simples) + opção 6 (logs)."
+        pausar
+        return
+    fi
+
+    if ! esta_rodando; then
+        warn "O servidor não está rodando — inicie-o antes."
+        pausar
+        return
+    fi
+
+    if [[ ! -p "$IN_FIFO" ]]; then
+        err "FIFO de comandos não encontrado ($IN_FIFO). Aguarde o servidor subir."
+        pausar
+        return
+    fi
+
+    # Se a sessão já existe, apenas reanexa.
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        log "Reanexando à sessão tmux existente..."
+        tmux attach -t "$TMUX_SESSION"
+        return
+    fi
+
+    log "Abrindo console + logs (tmux). Ctrl+B depois D para desanexar."
+    sleep 1
+
+    # Painel superior: logs ao vivo do journald.
+    tmux new-session -d -s "$TMUX_SESSION" -n decay \
+        "journalctl -u '$SERVICE_NAME' -f --no-pager"
+
+    # Painel inferior: loop de leitura que escreve na FIFO.
+    # Reexecuta este próprio script num modo interno dedicado (__prompt),
+    # evitando duplicar a lógica de envio.
+    tmux split-window -v -t "$TMUX_SESSION" \
+        "'$SELF' __prompt"
+
+    # Dá mais espaço ao log (70% em cima, 30% embaixo).
+    tmux resize-pane -t "$TMUX_SESSION".0 -y 70%
+
+    # Foca no painel de comando e anexa.
+    tmux select-pane -t "$TMUX_SESSION".1
+    tmux attach -t "$TMUX_SESSION"
+}
+
+# ── Modo interno: prompt de comandos (roda dentro do tmux) ──
+run_prompt() {
+    echo -e "${BOLD}Console do servidor Decay${NC}"
+    echo -e "Comandos vão para o servidor. Ex.: ${GREEN}adminset Joao true${NC}, ${GREEN}players${NC}"
+    echo -e "Os logs aparecem no painel de cima."
+    echo -e "Sair do painel: ${YELLOW}Ctrl+B${NC} depois ${YELLOW}D${NC} (servidor segue rodando)."
+    echo ""
+    while true; do
+        read -r -p "decay> " linha || break
+        [[ -z "$linha" ]] && continue
+        if [[ "$linha" == "sair" || "$linha" == "exit" ]]; then
+            echo "Feche o painel com Ctrl+B depois D."
+            continue
+        fi
+        enviar_comando "$linha"
+        local rc=$?
+        if (( rc == 2 )); then
+            err "FIFO indisponível — o servidor está rodando?"
+        else
+            echo -e "${CYAN}→ enviado:${NC} $linha"
+        fi
+    done
+}
+
+# ── 9. Monitor de recursos (CPU / RAM / Disco / Rede) ───────
 acao_monitor() {
     echo ""
     echo -e "  Atualizar continuamente (ao vivo) ou só um snapshot?"
@@ -329,7 +428,6 @@ render_monitor() {
     echo -e "  ${CYAN}$(date '+%F %T')${NC}   ·   Estado: $(status_curto)"
     echo ""
 
-    # ── PROCESSO DO JOGO ─────────────────────────────────────
     echo -e "${BOLD}── Processo do servidor (Unity) ──────────────${NC}"
     local pid; pid=$(pid_do_servidor)
     if [[ -z "$pid" ]]; then
@@ -350,20 +448,16 @@ render_monitor() {
     fi
     echo ""
 
-    # ── MÁQUINA: CPU ─────────────────────────────────────────
     echo -e "${BOLD}── Máquina ───────────────────────────────────${NC}"
     local ncpu; ncpu=$(nproc 2>/dev/null || echo "?")
     local load; load=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)
     printf "  Núcleos........: %s\n" "$ncpu"
     printf "  Load (1/5/15m).: %s\n" "$load"
 
-    # Uso de CPU agregado (amostra de 1s do /proc/stat)
     local cpu_uso
     cpu_uso=$(uso_cpu_total)
     printf "  CPU total......: %5s%%  %b\n" "$cpu_uso" "$(barra_pct "$cpu_uso")"
 
-    # ── MÁQUINA: RAM / SWAP ──────────────────────────────────
-    # Lê de /proc/meminfo para não depender do formato do `free`.
     local mem_total mem_avail mem_usado_pct swap_total swap_free swap_usado_pct
     mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
     mem_avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
@@ -390,8 +484,6 @@ render_monitor() {
         printf "  Swap...........: (desativado)\n"
     fi
 
-    # ── MÁQUINA: DISCO ───────────────────────────────────────
-    # Uso do disco onde fica o servidor.
     local disco
     disco=$(df -h --output=used,size,pcent "$SERVER_DIR" 2>/dev/null | tail -n1)
     if [[ -n "$disco" ]]; then
@@ -401,14 +493,11 @@ render_monitor() {
             "$SERVER_DIR" "$d_used" "$d_size" "$d_pct" "$(barra_pct "${d_pct%\%}")"
     fi
 
-    # Tamanho da pasta de logs (ajuda a flagrar log crescendo demais)
     if [[ -d "$LOG_DIR" ]]; then
         local logsz; logsz=$(du -sh "$LOG_DIR" 2>/dev/null | cut -f1)
         printf "  Pasta de logs..: %s\n" "${logsz:-?}"
     fi
 
-    # ── MÁQUINA: REDE ────────────────────────────────────────
-    # Total acumulado RX/TX desde o boot, somando interfaces físicas.
     local rede
     rede=$(rede_total)
     printf "  Rede (acum.)...: %s\n" "$rede"
@@ -434,7 +523,7 @@ uso_cpu_total() {
     fi
 }
 
-# Soma RX/TX (em MB/GB) das interfaces, ignorando loopback.
+# Soma RX/TX (em MB) das interfaces, ignorando loopback.
 rede_total() {
     local rx_total=0 tx_total=0 iface rx tx
     while read -r iface rx tx; do
@@ -443,7 +532,6 @@ rede_total() {
         tx_total=$(( tx_total + tx ))
     done < <(awk -F'[: ]+' 'NR>2 {print $2, $3, $11}' /proc/net/dev)
 
-    # bytes → MB
     local rx_mb=$(( rx_total / 1024 / 1024 ))
     local tx_mb=$(( tx_total / 1024 / 1024 ))
     echo "↓ ${rx_mb} MB  ·  ↑ ${tx_mb} MB"
@@ -463,8 +551,8 @@ menu() {
         echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
         echo -e "${BOLD}${CYAN}║          DECAY · PAINEL DO SERVIDOR        ║${NC}"
         echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
+        echo -e "  Diretório: ${SERVER_DIR}"
         echo -e "  Estado: $(status_curto)"
-        # Resumo rápido de CPU/RAM do jogo, só quando está rodando.
         if esta_rodando; then
             resumo_recursos
         fi
@@ -475,8 +563,9 @@ menu() {
         echo "  4) Reiniciar servidor"
         echo "  5) Status detalhado"
         echo "  6) Acompanhar logs (ao vivo)"
-        echo "  7) Console — enviar comandos"
-        echo "  8) Monitor de recursos (CPU/RAM/disco/rede)"
+        echo -e "  7) Console — enviar comandos (simples)"
+        echo -e "  8) Console + Logs juntos ${GREEN}(tmux, recomendado)${NC}"
+        echo "  9) Monitor de recursos (CPU/RAM/disco/rede)"
         echo "  0) Sair do painel (servidor continua rodando)"
         echo ""
         read -r -p "  Escolha: " opt
@@ -489,7 +578,8 @@ menu() {
             5) acao_status ;;
             6) acao_logs ;;
             7) acao_console ;;
-            8) acao_monitor ;;
+            8) acao_console_tmux ;;
+            9) acao_monitor ;;
             0) echo "Saindo. O servidor continua rodando em segundo plano."; exit 0 ;;
             *) warn "Opção inválida."; sleep 1 ;;
         esac
@@ -500,6 +590,7 @@ menu() {
 #  ENTRADA
 # ============================================================
 case "${1:-}" in
-    __run)  run_launcher ;;   # uso interno do systemd
-    *)      menu ;;           # painel interativo
+    __run)     run_launcher ;;   # uso interno do systemd
+    __prompt)  run_prompt ;;     # uso interno do painel tmux
+    *)         menu ;;           # painel interativo
 esac
