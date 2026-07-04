@@ -14,9 +14,9 @@
 set -u
 
 # ── Configuração ────────────────────────────────────────────
-SERVER_DIR="/home/matheus/servidordecay"
-USER_OWNER="matheus"
-GROUP_OWNER="matheus"
+SERVER_DIR="/home/ubuntu/servidordecay"
+USER_OWNER="ubuntu"
+GROUP_OWNER="ubuntu"
 APP_NAME="decay.x86_64"
 SERVICE_NAME="decay-server"
 

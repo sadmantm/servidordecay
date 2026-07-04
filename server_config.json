@@ -1,20 +1,21 @@
 {
-    "ServerId": "550e8400-e29b-41d4-a716-446655440000",
+    "ServerId": "0e8400-e29b-41d4-a716-446655440000",
     "NomeDoServidor": "Brasil MOBILE [DUO]",
     "DescricaoServidor": "Servidor brasileiro PvP/PvE",
     "DiscordUrl": "",
-    "IPDoServidor": "131.108.214.0",
+    "IPDoServidor": "54.233.119.151",
     "Porta": 3000,
     "Regiao": "BR",
-    "MasterBaseUrl": "http://52.67.66.140:3000",
+    "MasterBaseUrl": "http://172.31.6.215:3000",
     "ServerKey": "your-secret-server-key-change-in-production",
     "MaxPlayers": 50,
     "MapId": "island_v1",
     "BuildVersion": "0.1.0",
     "TipoServidor": 0,
-"LimiteDeTime": Duo,
+    "LimiteDeTime": "Duo",
     "BalanceamentoArmaduras": 1.0,
     "MultiplicadorDeColetas": 1.0,
-    "PlataformasPermitidas": "Mobile",
+    "PlataformasPermitidas": 1,
     "JogadoresBanidos": []
 }
+
