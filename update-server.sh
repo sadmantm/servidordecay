@@ -6,12 +6,9 @@ echo "======================================"
 echo " DECAY - Upload da Build via Git LFS"
 echo "======================================"
 
-echo ""
-echo "Verificando Git LFS..."
 git lfs install
 
-echo ""
-echo "Configurando arquivos grandes para Git LFS..."
+echo "Configurando Git LFS..."
 
 git lfs track "*.so"
 git lfs track "*.unity3d"
@@ -19,12 +16,11 @@ git lfs track "*.x86_64"
 git lfs track "*.assets"
 git lfs track "*.bundle"
 
-echo ""
 echo "Configurando .gitignore..."
 
 cat >> .gitignore << 'EOF'
 
-# Unity generated files
+# Unity project generated files
 [Ll]ibrary/
 [Tt]emp/
 [Oo]bj/
@@ -32,6 +28,11 @@ cat >> .gitignore << 'EOF'
 [Bb]uilds/
 [Ll]ogs/
 [Uu]ser[Ss]ettings/
+
+# Unity build debug backups — não enviar
+decay_BackUpThisFolder_ButDontShipItWithYourGame/
+*_BackUpThisFolder_ButDontShipItWithYourGame/
+*.debug
 
 # Visual Studio
 .vs/
@@ -41,36 +42,25 @@ cat >> .gitignore << 'EOF'
 Thumbs.db
 EOF
 
-echo ""
-echo "Adicionando configurações..."
+# Remove do índice caso tenha sido adicionado anteriormente.
+git rm -r --cached \
+  "decay_BackUpThisFolder_ButDontShipItWithYourGame" \
+  2>/dev/null || true
+
 git add .gitattributes
 git add .gitignore
-
-echo ""
-echo "Verificando arquivos LFS..."
-git lfs ls-files
-
-echo ""
-echo "Adicionando arquivos..."
 git add .
 
-echo ""
+echo "Arquivos LFS:"
+git lfs status
+
 echo "Status:"
 git status
 
-echo ""
-echo "Arquivos que serão enviados via LFS:"
-git lfs status
+git commit -m "Update Unity server build" || echo "Nada para commitar."
 
-echo ""
-echo "Criando commit..."
-git commit -m "Update Unity server build2" || echo "Nada para commitar."
-
-echo ""
-echo "Enviando para GitHub..."
 git push origin main
 
-echo ""
 echo "======================================"
 echo " Atualização enviada com sucesso!"
 echo "======================================"
