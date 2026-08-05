@@ -3,28 +3,15 @@
 #  decayhub.sh — Painel único do Servidor Dedicado Decay
 #
 #  MODOS:
-#    ./decayhub.sh            → abre o menu interativo (painel)
-#    ./decayhub.sh __run      → modo LANÇADOR (uso interno do systemd)
-#
-#  O servidor roda sob systemd (24/7, boot, restart em crash).
-#  Este hub é o painel de controle: instalar, iniciar, parar,
-#  reiniciar, status, logs, console ao vivo e monitor de recursos.
-#
-#  NOTA: este arquivo é autossuficiente. Ele gera a própria unit do
-#  systemd (ExecStart=... __run) e é o próprio lançador. Não depende
-#  de start_server.sh nem de um .service externo — ambos são legados
-#  e podem ser removidos.
+#    ./decayhub.sh            → menu interativo (painel)
+#    ./decayhub.sh __run      → LANÇADOR (uso interno do systemd)
+#    ./decayhub.sh __prompt   → prompt de comandos (uso interno do tmux)
 # ============================================================
 
 set -u
 
-# ── Configuração AUTODETECTADA ──────────────────────────────
-# O diretório do servidor é a pasta ONDE ESTE SCRIPT ESTÁ.
-# Assim cada máquina/instância funciona sem editar caminhos à mão.
+# ── Configuração autodetectada ──────────────────────────────
 SERVER_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-
-# Dono/grupo inferidos do dono real da pasta do servidor (não fixa "ubuntu").
-# Fallback para o usuário atual se o stat falhar.
 USER_OWNER="$(stat -c '%U' "$SERVER_DIR" 2>/dev/null || id -un)"
 GROUP_OWNER="$(stat -c '%G' "$SERVER_DIR" 2>/dev/null || id -gn)"
 
@@ -33,11 +20,27 @@ SERVICE_NAME="decay-server"
 
 APP="$SERVER_DIR/$APP_NAME"
 LOG_DIR="$SERVER_DIR/logs"
+BACKUP_DIR="$SERVER_DIR/backups"
+CURRENT_LOG="$LOG_DIR/current.log"
 IN_FIFO="$SERVER_DIR/.server_in.fifo"
 SELF="$(readlink -f "$0")"
 UNIT_PATH="/etc/systemd/system/$SERVICE_NAME.service"
-MAX_LOGS=14
+SYSCTL_PATH="/etc/sysctl.d/99-decay.conf"
 TMUX_SESSION="decay_console"
+
+LOG_RETENTION_DAYS=14
+BACKUP_RETENTION=20
+
+# Pastas de save geradas pelo jogo (irmãs de <app>_Data).
+SAVE_DIRS=("WorldSaves" "PlayerSaves")
+
+# Timeouts de encerramento. O do wrapper precisa ser MENOR que o do
+# systemd, senão o systemd mata antes de o wrapper terminar de esperar.
+STOP_WAIT_WRAPPER=120
+STOP_WAIT_SYSTEMD=150
+
+SWAP_FILE="/swapfile_decay"
+SWAP_SIZE_MB=4096
 
 # ── Cores ───────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -49,74 +52,107 @@ warn() { echo -e "${YELLOW}⚠ $*${NC}"; }
 err()  { echo -e "${RED}✘ $*${NC}"; }
 
 # ============================================================
-#  MODO LANÇADOR  (chamado pelo systemd: decayhub.sh __run)
-#  Sobe UMA execução do servidor em primeiro plano.
-#  O systemd reinicia quando cair.
+#  MODO LANÇADOR (systemd: decayhub.sh __run)
 # ============================================================
 run_launcher() {
     [[ ! -f "$APP" ]] && { echo "Executável não encontrado: $APP" >&2; exit 1; }
     chmod +x "$APP" 2>/dev/null
+
     mkdir -p "$LOG_DIR"
-    find "$LOG_DIR" -name "server_*.log" -mtime +$MAX_LOGS -delete 2>/dev/null
+    find "$LOG_DIR" -name "server_*.log" -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null
 
     local LOG_FILE="$LOG_DIR/server_$(date '+%Y-%m-%d_%H-%M-%S').log"
 
-    # FIFO de entrada (stdin do servidor = comandos do console)
-    rm -f "$IN_FIFO"
-    mkfifo "$IN_FIFO"
-    chmod 660 "$IN_FIFO"
+    # Link estável para o log da sessão atual — é o alvo do 'tail -F'.
+    ln -sfn "$LOG_FILE" "$CURRENT_LOG"
 
-    # Mantém a ponta de escrita aberta para o stdin não receber EOF.
-    sleep infinity > "$IN_FIFO" &
-    local HOLDER_PID=$!
+    # ── FIFO de comandos ────────────────────────────────────
+    # exec 3<> abre a FIFO em LEITURA-ESCRITA num descritor do próprio
+    # bash: não bloqueia e mantém o stdin do servidor sem EOF.
+    #
+    # ⚠️ A versão anterior usava 'sleep infinity > fifo &' como holder. Esse
+    # processo era filho do bash, e o 'wait' SEM ARGUMENTO espera TODOS os
+    # filhos — então quando o Unity caía por conta própria, o bash ficava
+    # preso no wait para sempre, o systemd via o processo principal vivo e
+    # NUNCA reiniciava. O Restart=always era letra morta.
+    rm -f "$IN_FIFO"
+    if ! mkfifo -m 660 "$IN_FIFO"; then
+        echo "Falha ao criar FIFO em $IN_FIFO" >&2
+        exit 1
+    fi
+    exec 3<>"$IN_FIFO"
 
     local SERVER_PID=""
-    cleanup_run() {
-        [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null
-        kill "$HOLDER_PID" 2>/dev/null
+    local ENCERRANDO=0
+
+    # ── Encerramento gracioso ───────────────────────────────
+    # Repassa SIGTERM ao Unity e ESPERA o processo sair de verdade. Sem
+    # isso o bash saía na hora e o save de encerramento (players +
+    # sleeping bodies + world save síncrono) era cortado no meio.
+    encerrar() {
+        [[ "$ENCERRANDO" == "1" ]] && return
+        ENCERRANDO=1
+
+        if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "[$(date '+%F %T')] SIGTERM -> Unity (PID $SERVER_PID). " \
+                 "Aguardando até ${STOP_WAIT_WRAPPER}s pelo save final..."
+            kill -TERM "$SERVER_PID" 2>/dev/null
+
+            local i=0
+            while kill -0 "$SERVER_PID" 2>/dev/null && (( i < STOP_WAIT_WRAPPER )); do
+                sleep 1
+                i=$((i + 1))
+            done
+
+            if kill -0 "$SERVER_PID" 2>/dev/null; then
+                echo "[$(date '+%F %T')] Unity NÃO saiu em ${STOP_WAIT_WRAPPER}s." \
+                     "SIGKILL — o save final provavelmente foi perdido."
+                kill -KILL "$SERVER_PID" 2>/dev/null
+            else
+                echo "[$(date '+%F %T')] Unity encerrou após ${i}s."
+            fi
+        fi
+
+        exec 3>&- 2>/dev/null
         rm -f "$IN_FIFO"
     }
-    trap cleanup_run SIGTERM SIGINT EXIT
+    trap encerrar SIGTERM SIGINT
+    trap encerrar EXIT
 
     echo "══════════════════════════════════════════"
     echo "[$(date '+%F %T')] Iniciando Decay Server"
     echo "Log: $LOG_FILE"
     echo "══════════════════════════════════════════"
 
-    "$APP" -batchmode -nographics -logFile - \
-        < "$IN_FIFO" \
-        2>&1 | tee "$LOG_FILE" &
+    # ⚠️ SEM pipeline e SEM tee: '-logFile <path>' faz o próprio Unity
+    # escrever no arquivo. Antes, '-logFile -' + 'tee' gravava cada linha
+    # DUAS vezes no disco (arquivo + journald), e o pipeline tornava a
+    # detecção de PID frágil ('jobs -p %1') e o exit code inútil (era o
+    # do tee, não o do jogo).
+    "$APP" -batchmode -nographics -logFile "$LOG_FILE" <&3 &
+    SERVER_PID=$!
 
-    SERVER_PID=$(jobs -p %1 2>/dev/null)
-    [[ -z "$SERVER_PID" ]] && SERVER_PID=$(pgrep -f "$APP_NAME" | head -n1)
     echo "[$(date '+%F %T')] PID do servidor: $SERVER_PID"
 
-    wait
+    # wait COM argumento: retorna o exit code real do Unity.
+    wait "$SERVER_PID"
     local EXIT_CODE=$?
+    SERVER_PID=""
+
     echo "[$(date '+%F %T')] Servidor encerrou (exit $EXIT_CODE)."
     exit $EXIT_CODE
 }
 
 # ============================================================
-#  HELPERS DO PAINEL
+#  HELPERS
 # ============================================================
+esta_rodando() { systemctl is-active --quiet "$SERVICE_NAME"; }
 
-# True se o serviço está ativo (rodando).
-esta_rodando() {
-    systemctl is-active --quiet "$SERVICE_NAME"
-}
-
-precisa_sudo() {
-    if [[ $EUID -ne 0 ]]; then
-        echo "sudo"
-    fi
-}
+precisa_sudo() { [[ $EUID -ne 0 ]] && echo "sudo"; }
 
 status_curto() {
     if esta_rodando; then
-        local pid
-        pid=$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null)
-        echo -e "${GREEN}● RODANDO${NC} (PID ${pid})"
+        echo -e "${GREEN}● RODANDO${NC}"
     elif systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
         echo -e "${YELLOW}○ PARADO${NC} (habilitado no boot)"
     elif [[ -f "$UNIT_PATH" ]]; then
@@ -126,125 +162,127 @@ status_curto() {
     fi
 }
 
-# ── PID do processo do JOGO (o executável Unity, não o wrapper) ─
+# PID do processo do JOGO. Prefere descer a partir do MainPID do systemd
+# em vez de um pgrep solto pela linha de comando.
 pid_do_servidor() {
-    pgrep -f "$APP_NAME" | head -n1
+    local main filho
+    main=$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null)
+    if [[ -n "$main" && "$main" != "0" ]]; then
+        filho=$(pgrep -P "$main" 2>/dev/null | head -n1)
+        [[ -n "$filho" ]] && { echo "$filho"; return; }
+    fi
+    pgrep -f "$APP" 2>/dev/null | head -n1
 }
 
-# ── Barra de progresso colorida para porcentagens ───────────
 barra_pct() {
     local pct=${1%.*}; local largura=${2:-20}
-    [[ -z "$pct" ]] && pct=0
+    [[ -z "$pct" || ! "$pct" =~ ^[0-9]+$ ]] && pct=0
     (( pct > 100 )) && pct=100
-    (( pct < 0 )) && pct=0
     local cheio=$(( pct * largura / 100 ))
-    local vazio=$(( largura - cheio ))
     local cor=$GREEN
     (( pct >= 75 )) && cor=$YELLOW
     (( pct >= 90 )) && cor=$RED
-    local b=""
-    local i
+    local b="" i
     for ((i=0; i<cheio; i++)); do b+="█"; done
-    for ((i=0; i<vazio; i++)); do b+="░"; done
+    for ((i=cheio; i<largura; i++)); do b+="░"; done
     echo -e "${cor}${b}${NC}"
 }
 
-# ── Linha de resumo curta (usada no topo do menu) ───────────
 resumo_recursos() {
     local pid; pid=$(pid_do_servidor)
-    if [[ -z "$pid" ]]; then
-        echo -e "  ${YELLOW}(sem processo do jogo para medir)${NC}"
-        return
-    fi
+    [[ -z "$pid" ]] && { echo -e "  ${YELLOW}(sem processo do jogo)${NC}"; return; }
     local cpu mem rss
     read -r cpu mem rss < <(ps -p "$pid" -o %cpu=,%mem=,rss= 2>/dev/null)
-    [[ -z "$cpu" ]] && { echo -e "  ${YELLOW}(processo encerrou durante a leitura)${NC}"; return; }
-    local rss_mb=$(( ${rss:-0} / 1024 ))
-    echo -e "  Jogo: ${BOLD}CPU ${cpu}%${NC}  ·  ${BOLD}RAM ${mem}% (${rss_mb} MB)${NC}  ·  PID ${pid}"
+    [[ -z "${cpu:-}" ]] && { echo -e "  ${YELLOW}(processo saiu na leitura)${NC}"; return; }
+    echo -e "  Jogo: ${BOLD}CPU ${cpu}%${NC} · ${BOLD}RAM $(( ${rss:-0} / 1024 )) MB (${mem}%)${NC} · PID ${pid}"
 }
 
-# ── Cria/garante um swapfile de 2GB (idempotente) ───────────
-SWAP_FILE="/swapfile_decay"
-SWAP_SIZE_MB=2048
+pausar() { echo ""; read -r -p "Pressione ENTER para continuar..."; }
 
-acao_criar_swap() {
+contar() {
+    local padrao="$1" arquivo="$2"
+    [[ -f "$arquivo" || -L "$arquivo" ]] || { echo 0; return; }
+    grep -Fc -- "$padrao" "$arquivo" 2>/dev/null | head -n1
+}
+
+# ============================================================
+#  1. INSTALAR / ATUALIZAR
+# ============================================================
+config_swap() {
     local SUDO; SUDO=$(precisa_sudo)
 
     if swapon --show 2>/dev/null | grep -q .; then
-        ok "Já existe swap ativo no sistema — pulando criação."
-        swapon --show
+        ok "Swap já ativo — mantendo."
         return 0
     fi
 
     if [[ -f "$SWAP_FILE" ]]; then
-        warn "Arquivo de swap já existe ($SWAP_FILE) mas não está ativo. Reativando..."
+        warn "Swapfile existe mas está inativo. Reativando..."
         $SUDO chmod 600 "$SWAP_FILE"
         $SUDO swapon "$SWAP_FILE" 2>/dev/null && { ok "Swap reativado."; return 0; }
-        warn "Falhou ao reativar arquivo existente — recriando do zero."
         $SUDO swapoff "$SWAP_FILE" 2>/dev/null
         $SUDO rm -f "$SWAP_FILE"
     fi
 
-    local disco_livre_mb
-    disco_livre_mb=$(df --output=avail -m "$(dirname "$SWAP_FILE")" 2>/dev/null | tail -n1 | tr -d ' ')
-    if [[ -z "$disco_livre_mb" ]] || (( disco_livre_mb < SWAP_SIZE_MB + 512 )); then
-        err "Espaço insuficiente para criar swap de ${SWAP_SIZE_MB}MB (livre: ${disco_livre_mb:-?}MB)."
-        warn "Pulando criação de swap. Libere espaço e rode a instalação novamente se necessário."
+    local livre
+    livre=$(df --output=avail -m "$(dirname "$SWAP_FILE")" 2>/dev/null | tail -n1 | tr -d ' ')
+    if [[ -z "$livre" ]] || (( livre < SWAP_SIZE_MB + 1024 )); then
+        err "Espaço insuficiente para swap de ${SWAP_SIZE_MB}MB (livre: ${livre:-?}MB)."
         return 1
     fi
 
-    log "Criando arquivo de swap de ${SWAP_SIZE_MB}MB em $SWAP_FILE..."
-    if ! $SUDO fallocate -l "${SWAP_SIZE_MB}M" "$SWAP_FILE" 2>/dev/null; then
-        warn "fallocate falhou (filesystem pode não suportar) — usando dd, pode demorar mais..."
-        $SUDO dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$SWAP_SIZE_MB" status=progress
-    fi
+    log "Criando swap de ${SWAP_SIZE_MB}MB..."
+    $SUDO fallocate -l "${SWAP_SIZE_MB}M" "$SWAP_FILE" 2>/dev/null \
+        || $SUDO dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$SWAP_SIZE_MB" status=progress
 
-    log "Ajustando permissões (600)..."
     $SUDO chmod 600 "$SWAP_FILE"
+    $SUDO mkswap "$SWAP_FILE" >/dev/null || { err "mkswap falhou."; return 1; }
+    $SUDO swapon "$SWAP_FILE" || { err "swapon falhou."; return 1; }
 
-    log "Formatando como swap..."
-    if ! $SUDO mkswap "$SWAP_FILE" >/dev/null; then
-        err "mkswap falhou. Abortando criação de swap."
-        $SUDO rm -f "$SWAP_FILE"
-        return 1
-    fi
+    grep -qF "$SWAP_FILE" /etc/fstab 2>/dev/null \
+        || echo "$SWAP_FILE none swap sw 0 0" | $SUDO tee -a /etc/fstab >/dev/null
 
-    log "Ativando swap..."
-    if ! $SUDO swapon "$SWAP_FILE"; then
-        err "swapon falhou. Verifique se o filesystem suporta swapfiles (ex.: btrfs precisa de tratamento especial)."
-        return 1
-    fi
-
-    if ! grep -qF "$SWAP_FILE" /etc/fstab 2>/dev/null; then
-        log "Adicionando entrada ao /etc/fstab..."
-        echo "$SWAP_FILE none swap sw 0 0" | $SUDO tee -a /etc/fstab >/dev/null
-    else
-        log "Entrada do swap já existe no /etc/fstab — não duplicando."
-    fi
-
-    ok "Swap de ${SWAP_SIZE_MB}MB criado e ativado."
-    free -h | grep -i swap
+    ok "Swap de ${SWAP_SIZE_MB}MB ativo."
 }
 
-# ── 1. Instalar / ajustar permissões + serviço ──────────────
-acao_instalar() {
+config_sysctl() {
     local SUDO; SUDO=$(precisa_sudo)
 
-    log "Diretório detectado: $SERVER_DIR"
+    log "Aplicando parâmetros de kernel..."
+    $SUDO tee "$SYSCTL_PATH" >/dev/null <<'EOF'
+# Buffers de socket. Sem isto o kernel CORTA silenciosamente os 7MB
+# configurados no KcpTransport + "Maximize Socket Buffers", e o servidor
+# roda com ~200KB em vez do que o Inspector mostra.
+net.core.rmem_max=8388608
+net.core.wmem_max=8388608
+net.core.rmem_default=262144
+net.core.wmem_default=262144
+
+# Prefere estrangular a matar por OOM. O GC Boehm (IL2CPP) quase não
+# devolve memória ao SO, então um pico transiente vira RSS permanente.
+vm.swappiness=10
+EOF
+    $SUDO sysctl --system >/dev/null 2>&1
+    ok "sysctl aplicado ($SYSCTL_PATH)."
+}
+
+acao_instalar() {
+    local SUDO; SUDO=$(precisa_sudo)
+    local estava_rodando=0
+    esta_rodando && estava_rodando=1
+
+    log "Diretório: $SERVER_DIR"
     log "Dono/grupo: $USER_OWNER:$GROUP_OWNER"
 
-    log "Ajustando dono para $USER_OWNER:$GROUP_OWNER..."
     $SUDO chown -R "$USER_OWNER:$GROUP_OWNER" "$SERVER_DIR"
-
-    log "Tornando executáveis..."
     chmod +x "$APP" 2>/dev/null || $SUDO chmod +x "$APP"
     chmod +x "$SELF" 2>/dev/null || $SUDO chmod +x "$SELF"
 
-    log "Garantindo pasta de logs..."
-    mkdir -p "$LOG_DIR"
-    chmod 755 "$LOG_DIR"
+    mkdir -p "$LOG_DIR" "$BACKUP_DIR"
+    chmod 755 "$LOG_DIR" "$BACKUP_DIR"
 
-    acao_criar_swap
+    config_swap
+    config_sysctl
 
     log "Instalando unit do systemd..."
     $SUDO tee "$UNIT_PATH" >/dev/null <<EOF
@@ -253,18 +291,40 @@ Description=Decay Dedicated Server
 After=network-online.target
 Wants=network-online.target
 
+# ⚠️ StartLimit* pertence a [Unit], NÃO a [Service]. Na seção errada o
+# systemd IGNORA as duas, e um bug de startup viraria crash loop
+# reiniciando a cada 5s indefinidamente.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=$USER_OWNER
 Group=$GROUP_OWNER
 WorkingDirectory=$SERVER_DIR
 ExecStart=$SELF __run
+
 Restart=always
-RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=10
+RestartSec=10
+
+# 'mixed' só é seguro porque o wrapper agora repassa o SIGTERM ao Unity
+# e ESPERA o processo sair. TimeoutStopSec > o do wrapper, senão o
+# systemd mata no meio da espera.
 KillSignal=SIGTERM
-TimeoutStopSec=30
+KillMode=mixed
+TimeoutStopSec=$STOP_WAIT_SYSTEMD
+
+# MemoryHigh ESTRANGULA e pressiona o GC. MemoryMax mataria sem save —
+# de propósito ausente.
+MemoryAccounting=yes
+MemoryHigh=2500M
+OOMScoreAdjust=-500
+
+LimitNOFILE=65535
+
+# O Unity escreve o log direto no arquivo (-logFile). O journald recebe
+# só as linhas do wrapper, então 'systemctl status' fica legível e o
+# disco não leva a mesma linha duas vezes.
 StandardOutput=journal
 StandardError=journal
 
@@ -272,337 +332,396 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    log "Recarregando systemd e habilitando no boot..."
     $SUDO systemctl daemon-reload
-    $SUDO systemctl enable "$SERVICE_NAME"
+    $SUDO systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 
-    ok "Instalação/permissões concluídas."
+    ok "Instalação concluída."
+
+    if (( estava_rodando )); then
+        warn "O serviço está rodando com a unit ANTIGA."
+        read -r -p "  Reiniciar agora para aplicar? [s/N]: " r
+        [[ "${r,,}" == "s" ]] && { $SUDO systemctl restart "$SERVICE_NAME"; ok "Reiniciado."; }
+    fi
     pausar
 }
 
-# ── 2. Iniciar ──────────────────────────────────────────────
+# ============================================================
+#  2-4. CONTROLE
+# ============================================================
 acao_iniciar() {
     if esta_rodando; then
-        warn "O servidor já está rodando."
+        warn "Já está rodando."
     else
         local SUDO; SUDO=$(precisa_sudo)
-        log "Iniciando servidor (segundo plano)..."
         $SUDO systemctl start "$SERVICE_NAME"
-        sleep 1
-        esta_rodando && ok "Servidor iniciado." || err "Falhou ao iniciar. Veja os logs."
+        sleep 2
+        esta_rodando && ok "Servidor iniciado." || err "Falhou — veja o diagnóstico (8)."
     fi
     pausar
 }
 
-# ── 3. Parar ────────────────────────────────────────────────
 acao_parar() {
     if ! esta_rodando; then
-        warn "O servidor não está rodando."
+        warn "Não está rodando."
+        pausar; return
+    fi
+    local SUDO; SUDO=$(precisa_sudo)
+    log "Parando... o save de encerramento pode levar até ${STOP_WAIT_WRAPPER}s. NÃO interrompa."
+    $SUDO systemctl stop "$SERVICE_NAME"
+    esta_rodando && err "Ainda rodando?" || ok "Servidor parado."
+
+    if grep -qF "SERVIDOR ENCERRADO CORRETAMENTE" "$CURRENT_LOG" 2>/dev/null; then
+        ok "Save de encerramento confirmado no log."
     else
-        local SUDO; SUDO=$(precisa_sudo)
-        log "Parando servidor..."
-        $SUDO systemctl stop "$SERVICE_NAME"
-        sleep 1
-        esta_rodando && err "Ainda rodando?" || ok "Servidor parado."
+        warn "NÃO encontrei 'SERVIDOR ENCERRADO CORRETAMENTE' no log."
+        warn "O save final pode não ter rodado — confira o diagnóstico (8)."
     fi
     pausar
 }
 
-# ── 4. Reiniciar ────────────────────────────────────────────
 acao_reiniciar() {
     local SUDO; SUDO=$(precisa_sudo)
-    log "Reiniciando servidor..."
+    if esta_rodando; then
+        warn "Jogadores conectados serão desconectados."
+        read -r -p "  Confirmar reinício? [s/N]: " r
+        [[ "${r,,}" != "s" ]] && { log "Cancelado."; pausar; return; }
+    fi
+    log "Reiniciando (aguardando o save final)..."
     $SUDO systemctl restart "$SERVICE_NAME"
-    sleep 1
-    esta_rodando && ok "Servidor reiniciado." || err "Falhou. Veja os logs."
+    sleep 2
+    esta_rodando && ok "Reiniciado." || err "Falhou — veja o diagnóstico (8)."
     pausar
 }
 
-# ── 5. Status detalhado ─────────────────────────────────────
-acao_status() {
-    echo ""
-    systemctl status "$SERVICE_NAME" --no-pager 2>/dev/null || warn "Serviço não instalado."
-    pausar
-}
-
-# ── 6. Acompanhar logs ──────────────────────────────────────
-acao_logs() {
-    echo ""
-    log "Logs ao vivo (Ctrl+C para voltar ao menu)."
-    echo ""
-    trap ' ' SIGINT
-    journalctl -u "$SERVICE_NAME" -f --no-pager
-    trap - SIGINT
-}
-
-# ── Envia UM comando para o servidor via FIFO ───────────────
-# Usado tanto pelo console simples quanto pelo painel tmux.
+# ============================================================
+#  5. CONSOLE + LOGS
+# ============================================================
 enviar_comando() {
     local linha="$1"
     [[ -z "$linha" ]] && return 1
-    if [[ ! -p "$IN_FIFO" ]]; then
-        return 2
-    fi
-    echo "$linha" > "$IN_FIFO"
+    [[ -p "$IN_FIFO" ]] || return 2
+    # timeout: sem leitor na outra ponta, a escrita bloquearia o painel.
+    timeout 2 bash -c "echo \"\$1\" > \"\$2\"" _ "$linha" "$IN_FIFO" || return 3
     return 0
 }
 
-# ── 7. Console simples (só escrita, fallback sem tmux) ──────
-acao_console() {
-    if ! esta_rodando; then
-        warn "O servidor não está rodando — inicie-o antes de usar o console."
-        pausar
-        return
-    fi
-    if [[ ! -p "$IN_FIFO" ]]; then
-        err "FIFO de comandos não encontrado ($IN_FIFO)."
-        warn "Se o servidor acabou de subir, aguarde 1-2s e tente de novo."
-        pausar
-        return
-    fi
-
-    echo ""
-    echo -e "${BOLD}Console do servidor${NC} — digite comandos e ENTER."
-    echo -e "Ex.: ${GREEN}adminset Joao true${NC}, ${GREEN}players${NC}"
-    echo -e "Digite ${YELLOW}sair${NC} (ou Ctrl+C) para voltar ao menu."
-    echo -e "Dica: para ver os logs ao mesmo tempo, use a opção 8 (tmux)."
-    echo ""
-
-    trap 'echo; return' SIGINT
-    while true; do
-        read -r -p "decay> " linha || break
-        [[ "$linha" == "sair" || "$linha" == "exit" ]] && break
-        [[ -z "$linha" ]] && continue
-        enviar_comando "$linha"
-        echo -e "${CYAN}→ enviado:${NC} $linha"
-    done
-    trap - SIGINT
-}
-
-# ── 8. Console + Logs juntos (tmux) ─────────────────────────
-# Abre uma sessão tmux dividida:
-#   painel de CIMA  → journalctl -f (logs ao vivo)
-#   painel de BAIXO → prompt que envia comandos para a FIFO
-# Desanexar: Ctrl+B depois D  (o servidor continua rodando).
-acao_console_tmux() {
-    if ! command -v tmux >/dev/null 2>&1; then
-        err "tmux não está instalado."
-        echo -e "  Instale com: ${GREEN}sudo apt install tmux${NC}"
-        echo -e "  Enquanto isso, use a opção 7 (console simples) + opção 6 (logs)."
-        pausar
-        return
-    fi
-
-    if ! esta_rodando; then
-        warn "O servidor não está rodando — inicie-o antes."
-        pausar
-        return
-    fi
-
-    if [[ ! -p "$IN_FIFO" ]]; then
-        err "FIFO de comandos não encontrado ($IN_FIFO). Aguarde o servidor subir."
-        pausar
-        return
-    fi
-
-    # Se a sessão já existe, apenas reanexa.
-    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-        log "Reanexando à sessão tmux existente..."
-        tmux attach -t "$TMUX_SESSION"
-        return
-    fi
-
-    log "Abrindo console + logs (tmux). Ctrl+B depois D para desanexar."
-    sleep 1
-
-    # Painel superior: logs ao vivo do journald.
-    tmux new-session -d -s "$TMUX_SESSION" -n decay \
-        "journalctl -u '$SERVICE_NAME' -f --no-pager"
-
-    # Painel inferior: loop de leitura que escreve na FIFO.
-    # Reexecuta este próprio script num modo interno dedicado (__prompt),
-    # evitando duplicar a lógica de envio.
-    tmux split-window -v -t "$TMUX_SESSION" \
-        "'$SELF' __prompt"
-
-    # Dá mais espaço ao log (70% em cima, 30% embaixo).
-    tmux resize-pane -t "$TMUX_SESSION".0 -y 70%
-
-    # Foca no painel de comando e anexa.
-    tmux select-pane -t "$TMUX_SESSION".1
-    tmux attach -t "$TMUX_SESSION"
-}
-
-# ── Modo interno: prompt de comandos (roda dentro do tmux) ──
 run_prompt() {
     echo -e "${BOLD}Console do servidor Decay${NC}"
-    echo -e "Comandos vão para o servidor. Ex.: ${GREEN}adminset Joao true${NC}, ${GREEN}players${NC}"
-    echo -e "Os logs aparecem no painel de cima."
+    echo -e "Ex.: ${GREEN}adminset Joao true${NC} · ${GREEN}players${NC}"
     echo -e "Sair do painel: ${YELLOW}Ctrl+B${NC} depois ${YELLOW}D${NC} (servidor segue rodando)."
     echo ""
     while true; do
         read -r -p "decay> " linha || break
         [[ -z "$linha" ]] && continue
         if [[ "$linha" == "sair" || "$linha" == "exit" ]]; then
-            echo "Feche o painel com Ctrl+B depois D."
+            echo "Use Ctrl+B depois D para fechar o painel."
             continue
         fi
         enviar_comando "$linha"
-        local rc=$?
-        if (( rc == 2 )); then
-            err "FIFO indisponível — o servidor está rodando?"
-        else
-            echo -e "${CYAN}→ enviado:${NC} $linha"
-        fi
+        case $? in
+            0) echo -e "${CYAN}→ enviado:${NC} $linha" ;;
+            2) err "FIFO ausente — o servidor está rodando?" ;;
+            3) err "Escrita na FIFO expirou — servidor travado ou sem leitor." ;;
+        esac
     done
 }
 
-# ── 9. Monitor de recursos (CPU / RAM / Disco / Rede) ───────
-acao_monitor() {
+# Fallback sem tmux: só envia comandos (logs ficam por conta do arquivo).
+console_simples() {
+    warn "tmux ausente — modo somente-comandos."
+    echo -e "Para ver os logs, abra outro terminal: ${GREEN}tail -F $CURRENT_LOG${NC}"
     echo ""
-    echo -e "  Atualizar continuamente (ao vivo) ou só um snapshot?"
-    echo -e "    ${GREEN}l${NC}) ao vivo (atualiza a cada 2s, Ctrl+C para sair)"
-    echo -e "    ${GREEN}s${NC}) snapshot único"
-    read -r -p "  Escolha [s]: " modo
-    modo=${modo:-s}
-
-    if [[ "$modo" == "l" || "$modo" == "L" ]]; then
-        trap 'echo; return' SIGINT
-        while true; do
-            clear
-            render_monitor
-            echo ""
-            echo -e "  ${YELLOW}Atualizando a cada 2s — Ctrl+C para voltar ao menu.${NC}"
-            sleep 2
-        done
-        trap - SIGINT
-    else
-        echo ""
-        render_monitor
-        pausar
-    fi
+    trap 'echo; return' SIGINT
+    while true; do
+        read -r -p "decay> " linha || break
+        [[ "$linha" == "sair" || "$linha" == "exit" ]] && break
+        [[ -z "$linha" ]] && continue
+        enviar_comando "$linha" && echo -e "${CYAN}→ enviado:${NC} $linha" || err "Falha no envio."
+    done
+    trap - SIGINT
 }
 
-# Desenha o painel de métricas (uma "tela").
+acao_console() {
+    if ! esta_rodando; then
+        warn "Inicie o servidor antes."
+        pausar; return
+    fi
+    if [[ ! -p "$IN_FIFO" ]]; then
+        err "FIFO não encontrada ($IN_FIFO). Aguarde 1-2s após o start."
+        pausar; return
+    fi
+
+    if ! command -v tmux >/dev/null 2>&1; then
+        console_simples
+        pausar; return
+    fi
+
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        tmux attach -t "$TMUX_SESSION"
+        return
+    fi
+
+    log "Abrindo console + logs. Ctrl+B depois D para desanexar."
+    sleep 1
+
+    # 'tail -F' segue o symlink current.log e sobrevive à rotação de log
+    # num restart do servidor. O journalctl não serve mais aqui: o Unity
+    # escreve direto no arquivo, não no journald.
+    tmux new-session -d -s "$TMUX_SESSION" -n decay \
+        "tail -n 200 -F '$CURRENT_LOG'"
+    tmux split-window -v -t "$TMUX_SESSION" "'$SELF' __prompt"
+    tmux resize-pane -t "$TMUX_SESSION".0 -y 70%
+    tmux select-pane -t "$TMUX_SESSION".1
+    tmux attach -t "$TMUX_SESSION"
+}
+
+# ============================================================
+#  6. STATUS & MONITOR
+# ============================================================
+uso_cpu_total() {
+    local a b idle_a idle_b total_a total_b v
+    read -ra a < <(awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8}' /proc/stat)
+    idle_a=${a[3]}; total_a=0
+    for v in "${a[@]}"; do total_a=$(( total_a + v )); done
+    sleep 1
+    read -ra b < <(awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8}' /proc/stat)
+    idle_b=${b[3]}; total_b=0
+    for v in "${b[@]}"; do total_b=$(( total_b + v )); done
+    local dt=$(( total_b - total_a )) di=$(( idle_b - idle_a ))
+    (( dt > 0 )) && echo $(( (dt - di) * 100 / dt )) || echo 0
+}
+
+# Taxa de rede em KB/s (a acumulada desde o boot não dizia nada útil).
+rede_taxa() {
+    local r1 t1 r2 t2
+    read -r r1 t1 < <(awk -F'[: ]+' 'NR>2 && $2!="lo" {r+=$3; t+=$11} END{print r, t}' /proc/net/dev)
+    sleep 1
+    read -r r2 t2 < <(awk -F'[: ]+' 'NR>2 && $2!="lo" {r+=$3; t+=$11} END{print r, t}' /proc/net/dev)
+    echo "↓ $(( (r2 - r1) / 1024 )) KB/s · ↑ $(( (t2 - t1) / 1024 )) KB/s"
+}
+
 render_monitor() {
-    echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║        MONITOR DE RECURSOS · DECAY         ║${NC}"
-    echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
-    echo -e "  ${CYAN}$(date '+%F %T')${NC}   ·   Estado: $(status_curto)"
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║       STATUS & MONITOR · DECAY              ║${NC}"
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════╝${NC}"
+    echo -e "  ${CYAN}$(date '+%F %T')${NC}  ·  $(status_curto)"
     echo ""
 
-    echo -e "${BOLD}── Processo do servidor (Unity) ──────────────${NC}"
+    echo -e "${BOLD}── Processo do jogo ─────────────────────────${NC}"
     local pid; pid=$(pid_do_servidor)
     if [[ -z "$pid" ]]; then
-        warn "Nenhum processo '$APP_NAME' em execução."
+        warn "Nenhum processo do jogo em execução."
     else
         local cpu mem rss nlwp etime
         read -r cpu mem rss nlwp etime < <(ps -p "$pid" -o %cpu=,%mem=,rss=,nlwp=,etime= 2>/dev/null)
-        if [[ -z "$cpu" ]]; then
-            warn "Processo encerrou durante a leitura."
+        if [[ -z "${cpu:-}" ]]; then
+            warn "Processo saiu durante a leitura."
         else
-            local rss_mb=$(( ${rss:-0} / 1024 ))
             printf "  PID............: %s\n" "$pid"
             printf "  Uptime.........: %s\n" "${etime// /}"
             printf "  Threads........: %s\n" "$nlwp"
             printf "  CPU............: %5s%%  %b\n" "$cpu" "$(barra_pct "$cpu")"
-            printf "  RAM (residente): %s MB (%s%% do total)  %b\n" "$rss_mb" "$mem" "$(barra_pct "$mem")"
+            printf "  RAM (RSS)......: %s MB (%s%%)  %b\n" \
+                "$(( ${rss:-0} / 1024 ))" "$mem" "$(barra_pct "$mem")"
+            echo -e "  ${CYAN}RSS deve estabilizar num platô. Subida contínua = leak.${NC}"
         fi
     fi
     echo ""
 
-    echo -e "${BOLD}── Máquina ───────────────────────────────────${NC}"
-    local ncpu; ncpu=$(nproc 2>/dev/null || echo "?")
-    local load; load=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)
-    printf "  Núcleos........: %s\n" "$ncpu"
-    printf "  Load (1/5/15m).: %s\n" "$load"
+    echo -e "${BOLD}── Máquina ──────────────────────────────────${NC}"
+    printf "  Núcleos........: %s\n" "$(nproc 2>/dev/null || echo '?')"
+    printf "  Load (1/5/15m).: %s\n" "$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
+    local c; c=$(uso_cpu_total)
+    printf "  CPU total......: %5s%%  %b\n" "$c" "$(barra_pct "$c")"
 
-    local cpu_uso
-    cpu_uso=$(uso_cpu_total)
-    printf "  CPU total......: %5s%%  %b\n" "$cpu_uso" "$(barra_pct "$cpu_uso")"
+    local mt ma st sf
+    mt=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+    ma=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+    st=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)
+    sf=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
 
-    local mem_total mem_avail mem_usado_pct swap_total swap_free swap_usado_pct
-    mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
-    mem_avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
-    swap_total=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)
-    swap_free=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
-
-    local mem_usado=$(( mem_total - mem_avail ))
-    if (( mem_total > 0 )); then
-        mem_usado_pct=$(( mem_usado * 100 / mem_total ))
-    else
-        mem_usado_pct=0
-    fi
+    local mu=$(( mt - ma )) mp=0
+    (( mt > 0 )) && mp=$(( mu * 100 / mt ))
     printf "  RAM............: %s / %s MB (%s%%)  %b\n" \
-        "$(( mem_usado / 1024 ))" "$(( mem_total / 1024 ))" "$mem_usado_pct" \
-        "$(barra_pct "$mem_usado_pct")"
+        "$(( mu / 1024 ))" "$(( mt / 1024 ))" "$mp" "$(barra_pct "$mp")"
 
-    if (( swap_total > 0 )); then
-        local swap_usado=$(( swap_total - swap_free ))
-        swap_usado_pct=$(( swap_usado * 100 / swap_total ))
+    if (( st > 0 )); then
+        local su=$(( st - sf )) sp=$(( (st - sf) * 100 / st ))
         printf "  Swap...........: %s / %s MB (%s%%)  %b\n" \
-            "$(( swap_usado / 1024 ))" "$(( swap_total / 1024 ))" "$swap_usado_pct" \
-            "$(barra_pct "$swap_usado_pct")"
+            "$(( su / 1024 ))" "$(( st / 1024 ))" "$sp" "$(barra_pct "$sp")"
     else
-        printf "  Swap...........: (desativado)\n"
+        printf "  Swap...........: ${RED}DESATIVADO${NC} (risco de OOM sem save)\n"
     fi
 
-    local disco
-    disco=$(df -h --output=used,size,pcent "$SERVER_DIR" 2>/dev/null | tail -n1)
-    if [[ -n "$disco" ]]; then
-        local d_used d_size d_pct
-        read -r d_used d_size d_pct <<< "$disco"
-        printf "  Disco (%s): %s / %s (%s)  %b\n" \
-            "$SERVER_DIR" "$d_used" "$d_size" "$d_pct" "$(barra_pct "${d_pct%\%}")"
+    local d; d=$(df -h --output=used,size,pcent "$SERVER_DIR" 2>/dev/null | tail -n1)
+    if [[ -n "$d" ]]; then
+        local du ds dp; read -r du ds dp <<< "$d"
+        printf "  Disco..........: %s / %s (%s)  %b\n" "$du" "$ds" "$dp" "$(barra_pct "${dp%\%}")"
     fi
-
-    if [[ -d "$LOG_DIR" ]]; then
-        local logsz; logsz=$(du -sh "$LOG_DIR" 2>/dev/null | cut -f1)
-        printf "  Pasta de logs..: %s\n" "${logsz:-?}"
-    fi
-
-    local rede
-    rede=$(rede_total)
-    printf "  Rede (acum.)...: %s\n" "$rede"
+    printf "  Logs...........: %s\n" "$(du -sh "$LOG_DIR" 2>/dev/null | cut -f1 || echo '?')"
+    printf "  Rede...........: %s\n" "$(rede_taxa)"
 }
 
-# Uso de CPU total em % a partir de duas amostras do /proc/stat.
-uso_cpu_total() {
-    local a b idle_a idle_b total_a total_b
-    a=($(awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8}' /proc/stat))
-    idle_a=${a[3]}
-    total_a=0; for v in "${a[@]}"; do total_a=$(( total_a + v )); done
-    sleep 1
-    b=($(awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8}' /proc/stat))
-    idle_b=${b[3]}
-    total_b=0; for v in "${b[@]}"; do total_b=$(( total_b + v )); done
-
-    local d_total=$(( total_b - total_a ))
-    local d_idle=$(( idle_b - idle_a ))
-    if (( d_total > 0 )); then
-        echo $(( (d_total - d_idle) * 100 / d_total ))
-    else
-        echo 0
-    fi
-}
-
-# Soma RX/TX (em MB) das interfaces, ignorando loopback.
-rede_total() {
-    local rx_total=0 tx_total=0 iface rx tx
-    while read -r iface rx tx; do
-        [[ "$iface" == "lo" ]] && continue
-        rx_total=$(( rx_total + rx ))
-        tx_total=$(( tx_total + tx ))
-    done < <(awk -F'[: ]+' 'NR>2 {print $2, $3, $11}' /proc/net/dev)
-
-    local rx_mb=$(( rx_total / 1024 / 1024 ))
-    local tx_mb=$(( tx_total / 1024 / 1024 ))
-    echo "↓ ${rx_mb} MB  ·  ↑ ${tx_mb} MB"
-}
-
-pausar() {
+acao_monitor() {
     echo ""
-    read -r -p "Pressione ENTER para continuar..."
+    echo -e "    ${GREEN}l${NC}) ao vivo (Ctrl+C para voltar)"
+    echo -e "    ${GREEN}s${NC}) snapshot"
+    echo -e "    ${GREEN}u${NC}) systemctl status (unit)"
+    read -r -p "  Escolha [s]: " modo
+    case "${modo:-s}" in
+        l|L)
+            trap 'echo; return' SIGINT
+            while true; do clear; render_monitor
+                echo -e "\n  ${YELLOW}Ctrl+C para voltar.${NC}"; done
+            trap - SIGINT ;;
+        u|U)
+            echo ""; systemctl status "$SERVICE_NAME" --no-pager -n 30 2>/dev/null \
+                || warn "Serviço não instalado."; pausar ;;
+        *) echo ""; render_monitor; pausar ;;
+    esac
+}
+
+# ============================================================
+#  7. BACKUP DOS SAVES
+# ============================================================
+acao_backup() {
+    mkdir -p "$BACKUP_DIR"
+    local existentes=() d
+    for d in "${SAVE_DIRS[@]}"; do
+        [[ -d "$SERVER_DIR/$d" ]] && existentes+=("$d")
+    done
+
+    if (( ${#existentes[@]} == 0 )); then
+        err "Nenhuma pasta de save encontrada em $SERVER_DIR"
+        warn "Esperado: ${SAVE_DIRS[*]}. O servidor já rodou e salvou ao menos uma vez?"
+        pausar; return
+    fi
+
+    local arq="$BACKUP_DIR/saves_$(date '+%Y-%m-%d_%H-%M-%S').tar.gz"
+    log "Compactando: ${existentes[*]}"
+    if tar -czf "$arq" -C "$SERVER_DIR" "${existentes[@]}" 2>/dev/null; then
+        ok "Backup: $arq ($(du -h "$arq" | cut -f1))"
+    else
+        err "Falha ao criar o backup."
+        pausar; return
+    fi
+
+    # Mantém só os N mais recentes.
+    local total
+    total=$(ls -1t "$BACKUP_DIR"/saves_*.tar.gz 2>/dev/null | wc -l)
+    if (( total > BACKUP_RETENTION )); then
+        ls -1t "$BACKUP_DIR"/saves_*.tar.gz | tail -n +$(( BACKUP_RETENTION + 1 )) \
+            | xargs -r rm -f
+        log "Backups antigos removidos (mantidos $BACKUP_RETENTION)."
+    fi
+
+    echo ""
+    echo -e "  Restaurar manualmente (${BOLD}com o servidor PARADO${NC}):"
+    echo -e "    ${GREEN}tar -xzf $arq -C $SERVER_DIR${NC}"
+    pausar
+}
+
+# ============================================================
+#  8. DIAGNÓSTICO
+# ============================================================
+linha_diag() {
+    local rotulo="$1" valor="$2" cor="${3:-$NC}"
+    printf "  %-34s ${cor}%s${NC}\n" "$rotulo" "$valor"
+}
+
+acao_diagnostico() {
+    clear
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║          DIAGNÓSTICO · DECAY                ║${NC}"
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════╝${NC}"
+
+    # ── Arquivos de save ────────────────────────────────────
+    echo -e "\n${BOLD}── Arquivos de save ─────────────────────────${NC}"
+    local ws="$SERVER_DIR/WorldSaves/world_transforms.json"
+    if [[ -f "$ws" ]]; then
+        linha_diag "world_transforms.json" \
+            "$(du -h "$ws" | cut -f1), $(date -r "$ws" '+%F %H:%M:%S')"
+        local objs
+        objs=$(grep -o '"worldObjectId"' "$ws" 2>/dev/null | wc -l)
+        linha_diag "Objetos no save" "$objs"
+    else
+        linha_diag "world_transforms.json" "AUSENTE" "$RED"
+    fi
+    [[ -f "$ws.backup" ]] \
+        && linha_diag "backup" "$(du -h "$ws.backup" | cut -f1), $(date -r "$ws.backup" '+%F %H:%M')" \
+        || linha_diag "backup" "ausente" "$YELLOW"
+
+    local tmps
+    tmps=$(find "$SERVER_DIR" -name "*.tmp" 2>/dev/null | wc -l)
+    (( tmps > 0 )) \
+        && linha_diag ".tmp órfãos (crash na escrita)" "$tmps" "$RED" \
+        || linha_diag ".tmp órfãos" "0"
+
+    if [[ -d "$SERVER_DIR/PlayerSaves" ]]; then
+        linha_diag "Saves de player" \
+            "$(find "$SERVER_DIR/PlayerSaves" -name '*.json' 2>/dev/null | wc -l)"
+        local corr
+        corr=$(find "$SERVER_DIR/PlayerSaves" -name '*.corrupted_*' 2>/dev/null | wc -l)
+        (( corr > 0 )) \
+            && linha_diag "Saves CORROMPIDOS" "$corr" "$RED" \
+            || linha_diag "Saves corrompidos" "0"
+    fi
+
+    # ── Marcadores no log ───────────────────────────────────
+    echo -e "\n${BOLD}── Log da sessão atual ──────────────────────${NC}"
+    if [[ ! -e "$CURRENT_LOG" ]]; then
+        warn "Sem log de sessão ($CURRENT_LOG). O servidor já rodou com este script?"
+        pausar; return
+    fi
+    linha_diag "Arquivo" "$(readlink -f "$CURRENT_LOG" | xargs basename)"
+
+    echo -e "\n  ${BOLD}Saúde do save${NC}"
+    local n
+    n=$(contar "[WorldSave] Captura de" "$CURRENT_LOG")
+    linha_diag "Saves de mundo concluídos" "$n" "$( ((n>0)) && echo "$GREEN" || echo "$YELLOW")"
+    n=$(contar "Save RECUSADO" "$CURRENT_LOG")
+    linha_diag "Saves recusados (queda de contagem)" "$n" "$( ((n>0)) && echo "$RED" || echo "$GREEN")"
+    n=$(contar "Salvar() adiado" "$CURRENT_LOG")
+    linha_diag "Saves adiados (restauração)" "$n" "$( ((n>0)) && echo "$YELLOW" || echo "$GREEN")"
+    n=$(contar "Restauração TRAVADA" "$CURRENT_LOG")
+    linha_diag "Restauração travada" "$n" "$( ((n>0)) && echo "$RED" || echo "$GREEN")"
+    n=$(contar "Save principal suspeito" "$CURRENT_LOG")
+    linha_diag "Save principal suspeito" "$n" "$( ((n>0)) && echo "$RED" || echo "$GREEN")"
+
+    echo -e "\n  ${BOLD}Corpo duplicado / sessão${NC}"
+    n=$(contar "reconectou pela conn" "$CURRENT_LOG")
+    linha_diag "Conexões fantasma resolvidas" "$n" "$CYAN"
+    n=$(contar "NÃO criado" "$CURRENT_LOG")
+    linha_diag "Corpos recusados (esperado > 0)" "$n" "$CYAN"
+
+    echo -e "\n  ${BOLD}Integridade de dados${NC}"
+    n=$(contar "Valor INVÁLIDO" "$CURRENT_LOG")
+    linha_diag "NaN/Infinity barrados" "$n" "$( ((n>0)) && echo "$RED" || echo "$GREEN")"
+    n=$(contar "JSON corrompido" "$CURRENT_LOG")
+    linha_diag "JSON corrompido" "$n" "$( ((n>0)) && echo "$RED" || echo "$GREEN")"
+    n=$(contar "peça(s) órfã(s)" "$CURRENT_LOG")
+    linha_diag "Podas de peças órfãs" "$n" "$YELLOW"
+
+    echo -e "\n  ${BOLD}Rede${NC}"
+    n=$(contar "because of exception" "$CURRENT_LOG")
+    linha_diag "Disconnects por exceção (bug seu)" "$n" "$( ((n>0)) && echo "$RED" || echo "$GREEN")"
+    n=$(contar "NullReferenceException" "$CURRENT_LOG")
+    linha_diag "NullReferenceException" "$n" "$( ((n>0)) && echo "$RED" || echo "$GREEN")"
+
+    echo -e "\n${BOLD}── Últimas capturas (main thread) ───────────${NC}"
+    grep -F "[WorldSave] Captura de" "$CURRENT_LOG" 2>/dev/null | tail -n 5 \
+        | sed 's/^/  /' || echo "  (nenhuma ainda)"
+
+    echo -e "\n${BOLD}── Config efetiva no boot ───────────────────${NC}"
+    grep -F "SERVIDOR INICIADO" "$CURRENT_LOG" 2>/dev/null | tail -n 1 | sed 's/^/  /' \
+        || echo "  (linha não encontrada)"
+
+    echo -e "\n${BOLD}── Últimos erros ────────────────────────────${NC}"
+    grep -E "^\s*\[?(WorldSave|Persistence|Net)?\]?.*(✘|ERRO|Error|Exception|RECUSADO|TRAVADA)" \
+        "$CURRENT_LOG" 2>/dev/null | tail -n 8 | cut -c1-120 | sed 's/^/  /' \
+        || echo "  (nenhum)"
+
+    pausar
 }
 
 # ============================================================
@@ -611,25 +730,22 @@ pausar() {
 menu() {
     while true; do
         clear
-        echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
-        echo -e "${BOLD}${CYAN}║          DECAY · PAINEL DO SERVIDOR        ║${NC}"
-        echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
-        echo -e "  Diretório: ${SERVER_DIR}"
+        echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════╗${NC}"
+        echo -e "${BOLD}${CYAN}║         DECAY · PAINEL DO SERVIDOR          ║${NC}"
+        echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════╝${NC}"
+        echo -e "  ${SERVER_DIR}"
         echo -e "  Estado: $(status_curto)"
-        if esta_rodando; then
-            resumo_recursos
-        fi
+        esta_rodando && resumo_recursos
         echo ""
-        echo "  1) Instalar / ajustar permissões"
-        echo "  2) Iniciar servidor (segundo plano)"
-        echo "  3) Parar servidor"
+        echo "  1) Instalar / atualizar (permissões, swap, sysctl, unit)"
+        echo "  2) Iniciar servidor"
+        echo "  3) Parar servidor (aguarda o save final)"
         echo "  4) Reiniciar servidor"
-        echo "  5) Status detalhado"
-        echo "  6) Acompanhar logs (ao vivo)"
-        echo -e "  7) Console — enviar comandos (simples)"
-        echo -e "  8) Console + Logs juntos ${GREEN}(tmux, recomendado)${NC}"
-        echo "  9) Monitor de recursos (CPU/RAM/disco/rede)"
-        echo "  0) Sair do painel (servidor continua rodando)"
+        echo -e "  5) Console + Logs ${GREEN}(tmux)${NC}"
+        echo "  6) Status & Monitor"
+        echo -e "  7) Backup dos saves ${YELLOW}(antes de cada deploy)${NC}"
+        echo -e "  8) Diagnóstico ${CYAN}(saúde do save e da rede)${NC}"
+        echo "  0) Sair (servidor continua rodando)"
         echo ""
         read -r -p "  Escolha: " opt
 
@@ -638,22 +754,19 @@ menu() {
             2) acao_iniciar ;;
             3) acao_parar ;;
             4) acao_reiniciar ;;
-            5) acao_status ;;
-            6) acao_logs ;;
-            7) acao_console ;;
-            8) acao_console_tmux ;;
-            9) acao_monitor ;;
-            0) echo "Saindo. O servidor continua rodando em segundo plano."; exit 0 ;;
+            5) acao_console ;;
+            6) acao_monitor ;;
+            7) acao_backup ;;
+            8) acao_diagnostico ;;
+            0) echo "Saindo. O servidor continua em segundo plano."; exit 0 ;;
             *) warn "Opção inválida."; sleep 1 ;;
         esac
     done
 }
 
 # ============================================================
-#  ENTRADA
-# ============================================================
 case "${1:-}" in
-    __run)     run_launcher ;;   # uso interno do systemd
-    __prompt)  run_prompt ;;     # uso interno do painel tmux
-    *)         menu ;;           # painel interativo
+    __run)     run_launcher ;;
+    __prompt)  run_prompt ;;
+    *)         menu ;;
 esac
