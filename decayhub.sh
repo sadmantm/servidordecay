@@ -36,8 +36,8 @@ SAVE_DIRS=("WorldSaves" "PlayerSaves")
 
 # Timeouts de encerramento. O do wrapper precisa ser MENOR que o do
 # systemd, senão o systemd mata antes de o wrapper terminar de esperar.
-STOP_WAIT_WRAPPER=120
-STOP_WAIT_SYSTEMD=150
+STOP_WAIT_WRAPPER=10
+STOP_WAIT_SYSTEMD=15
 
 SWAP_FILE="/swapfile_decay"
 SWAP_SIZE_MB=4096
@@ -98,22 +98,27 @@ run_launcher() {
                  "Aguardando até ${STOP_WAIT_WRAPPER}s pelo save final..."
             kill -TERM "$SERVER_PID" 2>/dev/null
 
-            local i=0
-            while kill -0 "$SERVER_PID" 2>/dev/null && (( i < STOP_WAIT_WRAPPER )); do
-                sleep 1
-                i=$((i + 1))
-            done
+            # Cão de guarda: mata só se estourar o prazo. O 'wait' abaixo
+            # retorna no instante em que o Unity realmente sai.
+            local INICIO=$SECONDS
+            ( sleep "$STOP_WAIT_WRAPPER"; kill -KILL "$SERVER_PID" 2>/dev/null ) &
+            local CAO=$!
 
-            if kill -0 "$SERVER_PID" 2>/dev/null; then
+            wait "$SERVER_PID" 2>/dev/null
+            local DECORRIDO=$(( SECONDS - INICIO ))
+
+            kill "$CAO" 2>/dev/null
+            wait "$CAO" 2>/dev/null
+
+            if (( DECORRIDO >= STOP_WAIT_WRAPPER )); then
                 echo "[$(date '+%F %T')] Unity NÃO saiu em ${STOP_WAIT_WRAPPER}s." \
                      "SIGKILL — o save final provavelmente foi perdido."
-                kill -KILL "$SERVER_PID" 2>/dev/null
             else
-                echo "[$(date '+%F %T')] Unity encerrou após ${i}s."
+                echo "[$(date '+%F %T')] Unity encerrou após ${DECORRIDO}s."
             fi
         fi
 
-        exec 3>&- 2>/dev/null
+        exec 3>&-
         rm -f "$IN_FIFO"
     }
     trap encerrar SIGTERM SIGINT
@@ -266,6 +271,25 @@ EOF
     ok "sysctl aplicado ($SYSCTL_PATH)."
 }
 
+# ── Seguidor de log resistente a troca de symlink ───────────
+run_tail() {
+    trap 'kill "${tp:-}" 2>/dev/null; exit 0' SIGTERM SIGINT EXIT
+    local atual="" alvo tp
+    while true; do
+        alvo=$(readlink -f "$CURRENT_LOG" 2>/dev/null)
+        if [[ -z "$alvo" || ! -f "$alvo" ]]; then
+            sleep 2; continue
+        fi
+        if [[ "$alvo" != "$atual" ]]; then
+            [[ -n "${tp:-}" ]] && { kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null; }
+            atual="$alvo"
+            echo -e "\n${CYAN}── seguindo $(basename "$alvo") ──${NC}\n"
+            tail -n 200 -F "$alvo" & tp=$!
+        fi
+        sleep 2
+    done
+}
+
 acao_instalar() {
     local SUDO; SUDO=$(precisa_sudo)
     local estava_rodando=0
@@ -280,6 +304,8 @@ acao_instalar() {
 
     mkdir -p "$LOG_DIR" "$BACKUP_DIR"
     chmod 755 "$LOG_DIR" "$BACKUP_DIR"
+    sysctl -w net.core.rmem_max=7340032
+    sysctl -w net.core.wmem_max=7340032
 
     config_swap
     config_sysctl
@@ -457,18 +483,21 @@ acao_console() {
     fi
 
     if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-        tmux attach -t "$TMUX_SESSION"
-        return
+        read -r -p "  Sessão existente. [a]nexar ou [r]ecriar? [a]: " s
+        if [[ "${s,,}" == "r" ]]; then
+            tmux kill-session -t "$TMUX_SESSION" 2>/dev/null
+        else
+            tmux attach -t "$TMUX_SESSION"
+            return
+        fi
     fi
 
     log "Abrindo console + logs. Ctrl+B depois D para desanexar."
     sleep 1
 
-    # 'tail -F' segue o symlink current.log e sobrevive à rotação de log
-    # num restart do servidor. O journalctl não serve mais aqui: o Unity
-    # escreve direto no arquivo, não no journald.
-    tmux new-session -d -s "$TMUX_SESSION" -n decay \
-        "tail -n 200 -F '$CURRENT_LOG'"
+    # __tail reabre o arquivo quando o symlink current.log é repontado
+    # (restart do servidor). O 'tail -F' cru ficava preso no log antigo.
+    tmux new-session -d -s "$TMUX_SESSION" -n decay "'$SELF' __tail"
     tmux split-window -v -t "$TMUX_SESSION" "'$SELF' __prompt"
     tmux resize-pane -t "$TMUX_SESSION".0 -y 70%
     tmux select-pane -t "$TMUX_SESSION".1
@@ -768,5 +797,6 @@ menu() {
 case "${1:-}" in
     __run)     run_launcher ;;
     __prompt)  run_prompt ;;
+    __tail)    run_tail ;;
     *)         menu ;;
 esac
