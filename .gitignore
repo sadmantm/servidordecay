@@ -135,3 +135,24 @@ decay_BackUpThisFolder_ButDontShipItWithYourGame/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Unity project generated files
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+
+# Unity build debug backups — não enviar
+decay_BackUpThisFolder_ButDontShipItWithYourGame/
+*_BackUpThisFolder_ButDontShipItWithYourGame/
+*.debug
+
+# Visual Studio
+.vs/
+
+# OS files
+.DS_Store
+Thumbs.db
