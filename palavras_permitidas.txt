@@ -1,0 +1,155 @@
+# =============================================================
+
+# palavras_permitidas.txt
+
+# Tokens que NUNCA devem ser censurados.
+
+#
+
+# IMPORTANTE:
+
+# Este arquivo precisa ser carregado pelo método Carregar():
+
+#
+
+# CarregarArquivo(
+
+# Path.Combine(pasta, "palavras_permitidas.txt"),
+
+# _permitidas
+
+# );
+
+#
+
+# A lista abaixo é focada principalmente em falsos positivos
+
+# causados pela estratégia de normalização.
+
+# =============================================================
+
+# ----- Falsos positivos conhecidos do "cu" -----
+
+cuscuz
+curso
+cursos
+escuro
+escura
+escuros
+desculpa
+desculpe
+desculpas
+cuidado
+cuidados
+cuidar
+cuidado
+curto
+curta
+curtos
+curtas
+curtir
+curtida
+curtindo
+curador
+curadora
+cultura
+cultural
+cultura
+culpa
+culpado
+culpada
+culpar
+culminar
+culminou
+cumprir
+cumprido
+cumprimento
+
+# ----- Falsos positivos conhecidos de "puta" -----
+
+reputacao
+reputacao
+reputar
+reputado
+amputar
+amputacao
+disputa
+disputar
+computador
+computacao
+computacional
+
+# ----- Falsos positivos conhecidos de "pau" -----
+
+pausa
+pausas
+paulista
+paulistas
+pauta
+pautar
+pautado
+pautas
+
+# ----- Falsos positivos conhecidos de "rola" -----
+
+rolamento
+rolar
+rolaçao
+rolacao
+rolando
+rolou
+rolos
+rolagem
+
+# ----- Falsos positivos conhecidos de "pica" / "pika" -----
+
+picada
+picadas
+picar
+picante
+picantes
+picasso
+
+# ----- Falsos positivos conhecidos em inglês -----
+
+classic
+class
+classes
+assistant
+assistance
+assessment
+assess
+assume
+assuming
+assignment
+assign
+pass
+passage
+passenger
+passport
+compass
+cocktail
+cockpit
+scacock
+
+# ----- Palavras comuns que podem ficar estranhas com leet -----
+
+casa
+casas
+teste
+testes
+sistema
+sistemas
+status
+site
+sites
+sinal
+sinais
+sorte
+sorteio
+sugestao
+sugestao
+sexta
+seta
+zero
+====

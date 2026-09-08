@@ -1,0 +1,148 @@
+# =============================================================
+
+# palavras_exatas.txt
+
+# Termos que só casam como PALAVRA/TOKEN INTEIRO.
+
+#
+
+# Use aqui termos curtos que aparecem dentro de palavras legítimas.
+
+# A comparação ocorre depois da normalização:
+
+# - minúsculas
+
+# - remoção de acentos
+
+# - leet
+
+# - separadores
+
+# - repetição de caracteres
+
+#
+
+# NÃO colocar aqui termos longos que sejam seguros de detectar
+
+# como substring: use palavras_contidas.txt nesses casos.
+
+# =============================================================
+
+# ----- Português / BR -----
+
+cu
+cus
+puta
+putas
+puto
+pau
+pica
+pika
+rola
+bosta
+bostas
+merda
+merdas
+tnc
+vtnc
+vsf
+fdp
+pqp
+krl
+crl
+prr
+pqp
+fml
+cacete
+xota
+xoxota
+bixa
+viado
+
+# ----- Espanhol / LATAM -----
+
+culo
+culero
+culera
+puta
+putas
+puto
+joder
+cojones
+coño
+polla
+verga
+cabron
+cabrona
+carajo
+mierda
+marica
+maricon
+maricón
+
+# ----- Argentina / Rio da Prata -----
+
+boludo
+boluda
+pelotudo
+pelotuda
+forro
+forra
+forros
+sorete
+soreta
+choto
+chota
+pajero
+pajera
+pajear
+pija
+orto
+ortiva
+gil
+gila
+gilipollas
+tarado
+tarada
+bolase
+conchudo
+conchuda
+
+# ----- Inglês -----
+
+fuck
+fucker
+fucking
+shit
+bullshit
+bitch
+bastard
+ass
+damn
+hell
+dick
+cock
+piss
+
+# ----- Expressões curtas / abreviações -----
+
+wtf
+stfu
+gtfo
+lmfao
+af
+bs
+ffs
+pos
+sob
+douche
+douchebag
+jackass
+smartass
+dipshit
+shithead
+asshole
+bitchass
+motherfucker
+motherfuck
+==========

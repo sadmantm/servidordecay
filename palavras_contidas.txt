@@ -1,0 +1,628 @@
+# =============================================================
+
+# palavras_contidas.txt
+
+# Termos que casam em QUALQUER POSIÇÃO da frase normalizada.
+
+#
+
+# Use somente termos relativamente inequívocos.
+
+# A normalização já trata:
+
+# - acentos
+
+# - leet
+
+# - separadores
+
+# - repetição de caracteres
+
+# - texto "colado"
+
+#
+
+# Ex.:
+
+# f.o.d.a -> foda
+
+# f0d4 -> foda
+
+# ffffoda -> foda (após colapso)
+
+#
+
+# ATENÇÃO:
+
+# Evite termos curtos como "negro", "japa", "gay", "china",
+
+# "árabe", "indio" etc. isoladamente, pois podem ser usados
+
+# de forma perfeitamente legítima. Prefira insultos/slurs
+
+# inequívocos ou expressões explicitamente ofensivas.
+
+# =============================================================
+
+# =============================================================
+
+# PORTUGUÊS / BRASIL — PALAVRÕES
+
+# =============================================================
+
+caralho
+caralh
+porra
+merda
+foda
+fodase
+foda-se
+fuder
+foder
+fudeu
+fodendo
+fodedor
+buceta
+boceta
+bucetao
+bucetão
+bucetinha
+piroca
+pinto
+cacete
+punheta
+punheteiro
+punheteira
+siririca
+cuzao
+cuzão
+cuzudo
+cuzuda
+cuzao
+cuzinho
+arrombado
+arrombada
+arrombadofilho
+otario
+otária
+otario
+babaca
+babacão
+babacao
+imbecil
+retardado
+retardada
+escroto
+escrota
+vagabundo
+vagabunda
+piranha
+quenga
+corno
+corna
+cornao
+cornão
+viado
+viada
+bicha
+traveco
+sapatão
+sapatona
+boiola
+baitola
+veado
+veada
+fdp
+filhadaputa
+filhodaputa
+filhadaputa
+filhodaputa
+seufilhodaputa
+seufilhodaputa
+vaiatomarnocu
+vaitomarnocu
+vaitomarnocú
+vaisefoder
+vai se foder
+vai se fude
+chupamerda
+chupabuceta
+chupapica
+comebosta
+comeshield
+vai tomar no cu
+tomarnocu
+tomarnocu
+enfiaocu
+enfiarocu
+vaiatacacete
+desgracado
+desgraçado
+desgracada
+desgraçada
+maldito
+maldita
+capeta
+diabo
+safado
+safada
+semvergonha
+semnoção
+semnocao
+babacão
+babacao
+molequeidiota
+idiotinha
+
+# =============================================================
+
+# PORTUGUÊS — OFENSAS / HUMILHAÇÃO
+
+# =============================================================
+
+lixo
+lixo humano
+escoria
+escória
+verme
+vermezinho
+parasita
+imundo
+imunda
+nojento
+nojenta
+asqueroso
+asquerosa
+ridiculo
+ridícula
+ridiculo
+burro
+burra
+anta
+jumento
+jumenta
+animal
+idiota
+idiotão
+idiotao
+estupido
+estúpido
+estupida
+estúpida
+cretino
+cretina
+imbecil
+inutil
+inútil
+incompetente
+fracassado
+fracassada
+loser
+
+# =============================================================
+
+# ESPANHOL — GERAL
+
+# =============================================================
+
+mierda
+coño
+cojones
+joder
+jodete
+jodido
+jodida
+putamadre
+puta
+puto
+putita
+cabrón
+cabron
+cabrona
+carajo
+verga
+polla
+cochino
+cochina
+marica
+maricon
+maricón
+maricona
+gilipollas
+idiota
+imbecil
+imbécil
+estupido
+estúpido
+estupida
+estúpida
+pendejo
+pendeja
+pinche
+chingar
+chingada
+chingado
+chingados
+chingatumadre
+chinga tu madre
+hijodeputa
+hijaputa
+hijodeputa
+hijadelaputa
+mamaguevo
+mamaguebo
+mamón
+mamon
+culero
+culera
+culiao
+culiada
+culiado
+culiado
+conchatumadre
+conchatumadre
+conchadetumadre
+conchuda
+conchudo
+pelotudo
+pelotuda
+
+# =============================================================
+
+# ARGENTINA / RIO DA PRATA
+
+# =============================================================
+
+boludo
+boluda
+reboludo
+reboluda
+pelotudo
+pelotuda
+pelotudazo
+pelotudaza
+forro
+forra
+forrito
+forrazo
+sorete
+soreta
+soretito
+choto
+chota
+chotazo
+pajero
+pajera
+pajote
+pija
+piola
+orto
+ortiva
+ortiva
+gil
+gila
+garka
+garca
+garcahijo
+hijodeputa
+hijoderemilputa
+hijoderemil
+remilputa
+recontraputa
+la concha de tu madre
+laconchadetumadre
+conchadetumadre
+conchuda
+conchudo
+andatealcarajo
+andate a la mierda
+andatealcarajo
+andatealamierda
+lacrame
+pelotudoalpedo
+alpedido
+mamarracho
+salame
+pajarraco
+tarado
+tarada
+grandeculo
+culosucio
+culo roto
+culoroto
+negro de mierda
+negra de mierda
+bolita de mierda
+cabecita de mierda
+
+# =============================================================
+
+# ESPANHOL / LATAM — XENOFobia E SLURS INEQUÍVOCOS
+
+# =============================================================
+
+sudaca
+sudacas
+sudaca de mierda
+sudacodemerda
+
+# Slur anti-negros/racista explícito.
+
+# Mantido aqui propositalmente para tolerância zero.
+
+negrata
+negratas
+negrodeculo
+negrodecu
+negrode mierda
+negrodemierda
+
+# Slurs étnicos explícitos encontrados em listas de moderação.
+
+# NÃO incluir demônimos comuns como "japa", "china", "indio" isoladamente.
+
+gallego de mierda
+boliviano de mierda
+peruano de mierda
+paraguaio de mierda
+paraguayo de mierda
+veneco de mierda
+chileno de mierda
+mexicano de mierda
+
+# =============================================================
+
+# INGLÊS — PALAVRÕES
+
+# =============================================================
+
+fuck
+fucking
+fucked
+fucker
+motherfucker
+motherfuck
+fuckface
+fuckhead
+fuckwit
+fuckoff
+fuckyou
+shit
+bullshit
+shitty
+shithead
+shitface
+shitbag
+shitbrain
+dipshit
+dumbshit
+horseshit
+batshit
+asshole
+arsehole
+asshat
+asswipe
+asslicker
+assclown
+assface
+dumbass
+smartass
+jackass
+badass
+bitch
+bitchy
+bitchface
+bitchass
+sonofabitch
+bastard
+dick
+dickhead
+dickwad
+dickweed
+cock
+cocksucker
+cockhead
+piss
+pissed
+pisshead
+wanker
+wank
+twat
+cunt
+prick
+douche
+douchebag
+scumbag
+degenerate
+pervert
+perv
+slut
+whore
+skank
+tramp
+bollocks
+bugger
+bloodyhell
+goddamn
+dammit
+damnit
+
+# =============================================================
+
+# INGLÊS — INSULTOS
+
+# =============================================================
+
+idiot
+moron
+imbecile
+retard
+retarded
+dumbass
+dumbfuck
+stupid
+loser
+creep
+creepy
+freak
+psycho
+nutjob
+lunatic
+asshat
+asswipe
+jerkoff
+jerk
+tool
+prick
+trash
+garbage
+humantrash
+pieceofshit
+scumbag
+lowlife
+dirtbag
+shitlord
+
+# =============================================================
+
+# INGLÊS — OFENSAS RACIAIS / ÉTNICAS
+
+#
+
+# Se o objetivo é tolerância zero, mantenha slurs explícitos.
+
+# Não bloqueie automaticamente palavras que também são identidades
+
+# legítimas ou nacionalidades normais.
+
+# =============================================================
+
+beaner
+spic
+spick
+wetback
+cracker
+honky
+chink
+gook
+kike
+raghead
+towelhead
+redskin
+gypsy
+paki
+wop
+dago
+kraut
+jap
+chinaman
+
+# =============================================================
+
+# INGLÊS — HOMOFOBIA / TRANSPHOBIA EXPLÍCITA
+
+# =============================================================
+
+fag
+faggot
+faggy
+dyke
+homo
+queerbait
+tranny
+shemale
+
+# =============================================================
+
+# OFENSAS RELIGIOSAS / IDENTITÁRIAS
+
+# =============================================================
+
+christkiller
+christkilling
+islamist pig
+muslim pig
+jewboy
+jewgirl
+kike
+heeb
+
+# =============================================================
+
+# EXPRESSÕES COMPOSTAS — EVASÃO POR "COLAR" PALAVRAS
+
+# =============================================================
+
+sonofabitch
+sonofabitch
+sonofabitch
+goofyourself
+fuckyou
+fuckoff
+shutthefuckup
+stfup
+getthefuckout
+gofuckyourself
+gofuckyoursel
+eatshit
+eatmyshit
+eatadick
+suckmydick
+suckit
+kissmyass
+lickmyass
+pieceofshit
+pieceoftrash
+youreashole
+youranasshole
+stupidfuck
+dumbfuck
+fuckingidiot
+fuckingmoron
+fuckingloser
+fuckingbastard
+
+# =============================================================
+
+# VARIAÇÕES / EVASÃO COMUNS
+
+# A normalização já trata separadores, leet e repetição;
+
+# estas entradas cobrem grafias muito usadas.
+
+# =============================================================
+
+f4ck
+f0ck
+fuk
+fuq
+phuck
+sh1t
+5h1t
+b1tch
+b1tch
+a55hole
+a55
+d1ck
+d1ckhead
+c0ck
+c0cksucker
+cunt
+kunt
+k1ke
+sp1c
+tr4nny
+f4g
+f4ggot
+wh0re
+5lut
+0tario
+p3lotudo
+b0ludo
+p1ja
+p0rra
+m3rda
+c4ralho
+buc3ta
+p1roca
+======
