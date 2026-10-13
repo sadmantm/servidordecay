@@ -16,36 +16,19 @@ git lfs track "*.x86_64"
 git lfs track "*.assets"
 git lfs track "*.bundle"
 
-echo "Configurando .gitignore..."
+echo "Verificando .gitignore existente..."
 
-cat >> .gitignore << 'EOF'
+if [ ! -f .gitignore ]; then
+    echo "ERRO: .gitignore não encontrado!"
+    echo "Execute este script na raiz do projeto."
+    exit 1
+fi
 
-# Unity project generated files
-[Ll]ibrary/
-[Tt]emp/
-[Oo]bj/
-[Bb]uild/
-[Bb]uilds/
-[Ll]ogs/
-[Uu]ser[Ss]ettings/
+# Remove do índice o backup que não deve ser enviado.
+git rm -r --cached --ignore-unmatch \
+    "decay_BackUpThisFolder_ButDontShipItWithYourGame"
 
-# Unity build debug backups — não enviar
-decay_BackUpThisFolder_ButDontShipItWithYourGame/
-*_BackUpThisFolder_ButDontShipItWithYourGame/
-*.debug
-
-# Visual Studio
-.vs/
-
-# OS files
-.DS_Store
-Thumbs.db
-EOF
-
-# Remove do índice caso tenha sido adicionado anteriormente.
-git rm -r --cached \
-  "decay_BackUpThisFolder_ButDontShipItWithYourGame" \
-  2>/dev/null || true
+echo "Adicionando arquivos ao Git..."
 
 git add .gitattributes
 git add .gitignore
