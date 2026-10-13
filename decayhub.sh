@@ -7,6 +7,7 @@
 #    ./decayhub.sh __run      → LANÇADOR (uso interno do systemd)
 #    ./decayhub.sh __prompt   → prompt de comandos (uso interno do tmux)
 #    ./decayhub.sh __tail     → seguidor de log  (uso interno do tmux)
+#    ./decayhub.sh __restart  → reinício programado (uso interno do timer)
 # ============================================================
 
 set -u
@@ -46,6 +47,9 @@ SAVE_DIRS=("WorldSaves" "PlayerSaves")
 #
 # Meça o seu:  systemctl stop decay-server && grep "Save síncrono" no log.
 # O do wrapper precisa ser MENOR que o do systemd.
+#
+# ⚠️ Depois de mudar estes valores, rode a opção 1 (regrava a unit) e
+# confira com:  systemctl show decay-server -p TimeoutStopUSec
 STOP_WAIT_WRAPPER=120
 STOP_WAIT_SYSTEMD=150
 
@@ -55,6 +59,33 @@ STOP_WAIT_SYSTEMD=150
 # Aqui swap é rede de segurança contra OOM, não memória de trabalho.
 SWAP_FILE="/swapfile_decay"
 SWAP_SIZE_MB=2048
+
+# ── Reinício programado ─────────────────────────────────────
+# O RSS do processo cresce até o OOM em poucos dias (OOM em 09/10 com
+# 6,8 GB; pico de 6,6 GB em 13/10 com MemoryMax de 7,07 GB). Até o
+# vazamento ser encontrado, o reinício diário é o que evita a queda.
+#
+# Hora LOCAL do sistema (o painel define America/Sao_Paulo).
+# O reinício acontece EXATAMENTE neste horário; o timer dispara antes
+# para dar tempo aos avisos.
+RESTART_HORARIO="06:00"
+
+# Minutos de antecedência dos avisos, em ordem DECRESCENTE. () = sem aviso.
+RESTART_AVISOS_MIN=(15 10 5 1)
+
+# Pula o reinício se o servidor subiu há menos que isso (ex.: alguém
+# reiniciou na mão de madrugada).
+RESTART_MIN_UPTIME_H=4
+
+# Comando de CONSOLE que avisa os jogadores no chat. %d = minutos restantes.
+# ⚠️ Troque pelo comando de broadcast que o console de vocês aceita.
+#    Exemplo (se o comando se chamar 'say'):
+#      RESTART_AVISO_CMD="say Servidor reinicia em %d min para manutencao."
+#    Vazio = reinicia sem avisar.
+#    Não use '%' no texto além do %d.
+RESTART_AVISO_CMD=""
+
+RESTART_UNIT="decay-restart"
 
 # ── Cores ───────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -141,6 +172,7 @@ run_launcher() {
     echo "══════════════════════════════════════════"
     echo "[$(date '+%F %T')] Iniciando Decay Server"
     echo "Log: $LOG_FILE"
+    echo "Timeout de encerramento do wrapper: ${STOP_WAIT_WRAPPER}s"
     echo "══════════════════════════════════════════"
 
     # ⚠️ SEM pipeline e SEM tee: '-logFile <path>' faz o próprio Unity
@@ -316,9 +348,10 @@ acao_dependencias() {
         || err "Falha ao instalar dependências."
 
     # ── Relógio ─────────────────────────────────────────────
-    # Wipe e Raid são agendados por hora de parede com UtcOffsetHoras.
-    # Deriva de relógio = wipe na hora errada. Na EC2, o Amazon Time Sync
-    # fica no endereço de link-local abaixo e não depende de internet.
+    # Wipe, Raid e o reinício programado são agendados por hora de
+    # parede. Deriva de relógio = evento na hora errada. Na EC2, o Amazon
+    # Time Sync fica no endereço de link-local abaixo; fora da AWS ele
+    # simplesmente não responde e o chrony usa os servidores padrão.
     if [[ -f /etc/chrony/chrony.conf ]] \
        && ! grep -q '169.254.169.123' /etc/chrony/chrony.conf; then
         echo 'server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4' \
@@ -329,9 +362,9 @@ acao_dependencias() {
     $SUDO timedatectl set-timezone America/Sao_Paulo 2>/dev/null
 
     # ── Reboot automático ───────────────────────────────────
-    # As imagens Ubuntu da AWS vêm com unattended-upgrades ativo. Um
-    # reboot automático às 3h da manhã no meio de um raid é bem capaz
-    # de acontecer. Atualizar tudo bem; reiniciar sozinho, não.
+    # As imagens Ubuntu vêm com unattended-upgrades ativo. Um reboot
+    # automático às 3h da manhã no meio de um raid é bem capaz de
+    # acontecer. Atualizar tudo bem; reiniciar sozinho, não.
     echo 'Unattended-Upgrade::Automatic-Reboot "false";' \
         | $SUDO tee /etc/apt/apt.conf.d/99-decay-no-reboot >/dev/null
 
@@ -413,8 +446,8 @@ config_sysctl() {
 # O teto precisa ser MAIOR que o pedido, não igual.
 net.core.rmem_max=8388608
 net.core.wmem_max=8388608
-net.core.rmem_default=262144
-net.core.wmem_default=262144
+net.core.rmem_default=1048576
+net.core.wmem_default=1048576
 net.core.netdev_max_backlog=5000
 
 # Prefere estrangular a matar por OOM. O GC do IL2CPP devolve pouco ao
@@ -450,6 +483,162 @@ run_tail() {
 }
 
 # ============================================================
+#  REINÍCIO PROGRAMADO
+# ============================================================
+
+# Segundos desde que o serviço do jogo ficou ativo.
+uptime_servico_s() {
+    local desde_us agora_s
+    desde_us=$(systemctl show -p ActiveEnterTimestampMonotonic --value "$SERVICE_NAME" 2>/dev/null)
+    agora_s=$(awk '{print int($1)}' /proc/uptime)
+    [[ -z "$desde_us" || "$desde_us" == "0" ]] && { echo 0; return; }
+    echo $(( agora_s - desde_us / 1000000 ))
+}
+
+avisar_reinicio() {
+    local min="$1"
+    echo "[$(date '+%F %T')] Aviso: reinício em ${min} min."
+    [[ -z "$RESTART_AVISO_CMD" ]] && return
+    # shellcheck disable=SC2059
+    enviar_comando "$(printf "$RESTART_AVISO_CMD" "$min")" \
+        || echo "[$(date '+%F %T')] Falha ao enviar aviso pela FIFO."
+}
+
+# Modo __restart: executado pelo decay-restart.service (disparado pelo timer).
+run_restart_agendado() {
+    echo "[$(date '+%F %T')] Reinício programado iniciado."
+
+    if ! esta_rodando; then
+        echo "[$(date '+%F %T')] Servidor parado — nada a fazer."
+        exit 0
+    fi
+
+    local up; up=$(uptime_servico_s)
+    if (( up < RESTART_MIN_UPTIME_H * 3600 )); then
+        echo "[$(date '+%F %T')] Servidor no ar há só $(( up / 60 )) min" \
+             "(< ${RESTART_MIN_UPTIME_H}h). Reinício PULADO."
+        exit 0
+    fi
+
+    local n=${#RESTART_AVISOS_MIN[@]} i atual proximo
+    for (( i = 0; i < n; i++ )); do
+        atual=${RESTART_AVISOS_MIN[$i]}
+        proximo=${RESTART_AVISOS_MIN[$((i + 1))]:-0}
+
+        avisar_reinicio "$atual"
+        sleep $(( (atual - proximo) * 60 ))
+
+        if ! esta_rodando; then
+            echo "[$(date '+%F %T')] Servidor parou durante os avisos — abortando."
+            exit 0
+        fi
+    done
+
+    local rss_mb=0 pid
+    pid=$(pid_do_servidor)
+    [[ -n "$pid" ]] && rss_mb=$(( $(ps -o rss= -p "$pid" 2>/dev/null || echo 0) / 1024 ))
+
+    echo "[$(date '+%F %T')] Reiniciando após $(( up / 3600 ))h no ar" \
+         "(RSS ${rss_mb} MB). Aguardando o save final..."
+    local INICIO=$SECONDS
+    systemctl restart "$SERVICE_NAME"
+    echo "[$(date '+%F %T')] Reinício concluído em $(( SECONDS - INICIO ))s."
+}
+
+instalar_restart_timer() {
+    local SUDO; SUDO=$(precisa_sudo)
+
+    if [[ ! "$RESTART_HORARIO" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+        err "RESTART_HORARIO inválido: '$RESTART_HORARIO' (use HH:MM, ex.: 06:00)."
+        return 1
+    fi
+
+    local lead=${RESTART_AVISOS_MIN[0]:-0}
+    local disparo
+    disparo=$(date -d "$RESTART_HORARIO $lead minutes ago" '+%H:%M' 2>/dev/null) \
+        || { err "Não consegui calcular o horário de disparo."; return 1; }
+
+    # Avisos + o próprio stop (até STOP_WAIT_SYSTEMD) + folga.
+    local timeout_min=$(( lead + STOP_WAIT_SYSTEMD / 60 + 10 ))
+
+    $SUDO tee "/etc/systemd/system/$RESTART_UNIT.service" >/dev/null <<EOF
+[Unit]
+Description=Decay - reinício programado (avisos + restart)
+
+[Service]
+Type=oneshot
+ExecStart=$SELF __restart
+TimeoutStartSec=${timeout_min}min
+EOF
+
+    $SUDO tee "/etc/systemd/system/$RESTART_UNIT.timer" >/dev/null <<EOF
+[Unit]
+Description=Decay - reinício diário às $RESTART_HORARIO (dispara às $disparo para os avisos)
+
+[Timer]
+OnCalendar=*-*-* $disparo:00
+AccuracySec=1s
+# false: se a máquina estava desligada no horário, NÃO reinicia ao ligar.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable --now "$RESTART_UNIT.timer" >/dev/null 2>&1
+
+    ok "Reinício diário às $RESTART_HORARIO (avisos a partir das $disparo)."
+    [[ -z "$RESTART_AVISO_CMD" ]] && \
+        warn "RESTART_AVISO_CMD vazio: os jogadores NÃO serão avisados no chat."
+}
+
+remover_restart_timer() {
+    local SUDO; SUDO=$(precisa_sudo)
+    $SUDO systemctl disable --now "$RESTART_UNIT.timer" 2>/dev/null
+    $SUDO rm -f "/etc/systemd/system/$RESTART_UNIT.timer" \
+                "/etc/systemd/system/$RESTART_UNIT.service"
+    $SUDO systemctl daemon-reload
+    ok "Reinício programado removido."
+}
+
+status_restart_timer() {
+    if systemctl is-enabled --quiet "$RESTART_UNIT.timer" 2>/dev/null; then
+        local prox
+        prox=$(systemctl show -p NextElapseUSecRealtime --value "$RESTART_UNIT.timer" 2>/dev/null)
+        echo -e "${GREEN}ATIVO${NC} · ${RESTART_HORARIO} · próximo disparo: ${prox:-?}"
+    else
+        echo -e "${YELLOW}DESATIVADO${NC}"
+    fi
+}
+
+acao_reinicio_programado() {
+    echo ""
+    echo -e "  Estado: $(status_restart_timer)"
+    echo ""
+    echo -e "  Config (topo do script): ${BOLD}$RESTART_HORARIO${NC}" \
+            "· avisos: ${RESTART_AVISOS_MIN[*]:-nenhum} min" \
+            "· uptime mínimo: ${RESTART_MIN_UPTIME_H}h"
+    if [[ -z "$RESTART_AVISO_CMD" ]]; then
+        echo -e "  Aviso no chat: ${YELLOW}desligado${NC} (RESTART_AVISO_CMD vazio)"
+    else
+        echo -e "  Aviso no chat: ${GREEN}$RESTART_AVISO_CMD${NC}"
+    fi
+    echo ""
+    echo -e "    ${GREEN}i${NC}) instalar / atualizar (relê as variáveis do topo do script)"
+    echo -e "    ${GREEN}r${NC}) remover"
+    echo -e "    ${GREEN}l${NC}) log das últimas execuções"
+    read -r -p "  Escolha [voltar]: " op
+    case "${op:-}" in
+        i|I) instalar_restart_timer ;;
+        r|R) remover_restart_timer ;;
+        l|L) journalctl -u "$RESTART_UNIT.service" -n 40 --no-pager 2>/dev/null \
+                 || warn "Sem execuções registradas." ;;
+    esac
+    pausar
+}
+
+# ============================================================
 #  1. INSTALAR / ATUALIZAR
 # ============================================================
 acao_instalar() {
@@ -471,11 +660,6 @@ acao_instalar() {
     mkdir -p "$LOG_DIR" "$BACKUP_DIR"
     chmod 755 "$LOG_DIR" "$BACKUP_DIR"
 
-    # ⚠️ Aqui havia dois 'sysctl -w' soltos, sem $SUDO, com o valor
-    # 7340032 — idêntico ao KcpRecvBufferSize (o teto tem que ser MAIOR)
-    # e conflitando com os 8388608 que o config_sysctl grava logo abaixo.
-    # Eram código morto que confundia o diagnóstico. Removidos.
-
     config_swap
     config_sysctl
 
@@ -484,8 +668,7 @@ acao_instalar() {
     # teto: ao ultrapassá-lo o cgroup entra em RECLAIM AGRESSIVO e o
     # kernel despeja páginas do processo para o swap. O GC toca nelas na
     # frame seguinte e elas voltam — thrashing criado por configuração,
-    # com RAM sobrando na máquina. É o mesmo travamento de sempre.
-    # Agora só um teto de segurança acima do platô real (~1,6 GB medido).
+    # com RAM sobrando na máquina. Agora só um teto de segurança.
     local MEM_TOTAL_MB MEM_MAX_MB
     MEM_TOTAL_MB=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)
     MEM_MAX_MB=$(( MEM_TOTAL_MB * 85 / 100 ))
@@ -541,12 +724,19 @@ EOF
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 
+    ok "Unit instalada (TimeoutStopSec=${STOP_WAIT_SYSTEMD}s, wrapper ${STOP_WAIT_WRAPPER}s)."
+
+    echo ""
+    read -r -p "  Configurar o reinício diário programado ($RESTART_HORARIO)? [S/n]: " r
+    [[ "${r,,}" != "n" ]] && instalar_restart_timer
+
     ok "Instalação concluída."
     echo ""
     verificar_ip_publico
 
     if (( estava_rodando )); then
         warn "O serviço está rodando com a unit ANTIGA."
+        warn "O novo timeout de encerramento só vale depois de reiniciar."
         read -r -p "  Reiniciar agora para aplicar? [s/N]: " r
         [[ "${r,,}" == "s" ]] && { $SUDO systemctl restart "$SERVICE_NAME"; ok "Reiniciado."; }
     fi
@@ -765,6 +955,16 @@ render_monitor() {
             printf "  RAM (RSS)......: %s MB (%s%%)  %b\n" \
                 "$(( ${rss:-0} / 1024 ))" "$mem" "$(barra_pct "$mem")"
 
+            # Distância até o MemoryMax da unit: é o que define o OOM.
+            local mmax
+            mmax=$(systemctl show -p MemoryMax --value "$SERVICE_NAME" 2>/dev/null)
+            if [[ "$mmax" =~ ^[0-9]+$ ]] && (( mmax > 0 )); then
+                local pmax=$(( ${rss:-0} * 1024 * 100 / mmax ))
+                printf "  RSS / MemoryMax: %s%% de %s MB  %b\n" \
+                    "$pmax" "$(( mmax / 1024 / 1024 ))" "$(barra_pct "$pmax")"
+                (( pmax >= 85 )) && echo -e "  ${RED}Perto do MemoryMax: risco de OOM kill.${NC}"
+            fi
+
             local sw
             sw=$(awk '/^VmSwap:/{print int($2/1024)}' "/proc/$pid/status" 2>/dev/null)
             if [[ -n "${sw:-}" ]]; then
@@ -776,7 +976,7 @@ render_monitor() {
             fi
 
             # ── O número que decide tudo ────────────────────
-            local tq tpct tname
+            local tpct tname
             read -r tpct tname _ < <(thread_mais_quente "$pid")
             printf "  Thread + quente: %5s%% (%s)  %b\n" "$tpct" "$tname" "$(barra_pct "$tpct")"
             if (( tpct >= 90 )); then
@@ -786,6 +986,7 @@ render_monitor() {
             echo -e "  ${CYAN}RSS deve estabilizar num platô. Subida contínua = leak.${NC}"
         fi
     fi
+    printf "  Reinício diário: %b\n" "$(status_restart_timer)"
     echo ""
 
     echo -e "${BOLD}── Máquina ──────────────────────────────────${NC}"
@@ -836,10 +1037,16 @@ render_monitor() {
     printf "  Logs...........: %s\n" "$(du -sh "$LOG_DIR" 2>/dev/null | cut -f1 || echo '?')"
     printf "  Rede...........: %s\n" "$(rede_taxa)"
 
+    # Descartes de UDP por buffer cheio: o contador é desde o boot, então
+    # o que importa é se ele está SUBINDO entre duas leituras.
+    local rcvbuf
+    rcvbuf=$(awk '/^Udp:/{n++} n==2 && /^Udp:/{print $6; exit}' /proc/net/snmp 2>/dev/null)
+    [[ -n "${rcvbuf:-}" ]] && printf "  UDP RcvbufErrors: %s (desde o boot; compare entre leituras)\n" "$rcvbuf"
+
     if command -v vnstat >/dev/null 2>&1; then
         local tx
         tx=$(vnstat --oneline 2>/dev/null | cut -d';' -f10)
-        [[ -n "${tx:-}" ]] && printf "  Egress no mês..: %s  ${CYAN}(× \$0,15/GB em sa-east-1)${NC}\n" "$tx"
+        [[ -n "${tx:-}" ]] && printf "  Egress no mês..: %s\n" "$tx"
     fi
 }
 
@@ -889,8 +1096,8 @@ acao_backup() {
     local arq="$BACKUP_DIR/saves_$(date '+%Y-%m-%d_%H-%M-%S').tar.gz"
     log "Compactando: ${existentes[*]}"
 
-    # nice/ionice: com 2 vCPU, um tar de dezenas de MB compete
-    # diretamente com a main thread do Unity.
+    # nice/ionice: um tar de dezenas de MB compete diretamente com a
+    # main thread do Unity.
     if nice -n 19 ionice -c3 tar -czf "$arq" -C "$SERVER_DIR" "${existentes[@]}" 2>/dev/null; then
         ok "Backup: $arq ($(du -h "$arq" | cut -f1))"
     else
@@ -972,6 +1179,18 @@ acao_diagnostico() {
             || linha_diag "Saves corrompidos" "0"
     fi
 
+    # ── Encerramentos recentes ──────────────────────────────
+    echo -e "\n${BOLD}── Encerramentos recentes ───────────────────${NC}"
+    local kills
+    kills=$(journalctl -u "$SERVICE_NAME" --since "-7 days" --no-pager 2>/dev/null \
+            | grep -c "SIGKILL — o save final")
+    linha_diag "SIGKILL no encerramento (7 dias)" "${kills:-0}" \
+        "$( (( ${kills:-0} > 0 )) && echo "$RED" || echo "$GREEN")"
+    local ooms
+    ooms=$(dmesg -T 2>/dev/null | grep -c "Killed process.*$APP_NAME")
+    linha_diag "OOM kills (desde o boot)" "${ooms:-0}" \
+        "$( (( ${ooms:-0} > 0 )) && echo "$RED" || echo "$GREEN")"
+
     # ── Config efetiva ──────────────────────────────────────
     if tem_jq && [[ -f "$CONFIG_JSON" ]]; then
         echo -e "\n${BOLD}── Config efetiva (server_config.json) ──────${NC}"
@@ -981,8 +1200,10 @@ acao_diagnostico() {
         linha_diag "SendRate / TargetFrameRate" \
             "$(cfg .Rede.SendRate) / $(cfg .Rede.TargetFrameRate)"
         linha_diag "KcpTimeout" "$(cfg .Rede.KcpTimeout) ms"
-        linha_diag "Save: lote / orçamento" \
-            "$(cfg .Save.ObjetosPorLote) obj / $(cfg .Save.OrcamentoMsPorFrame) ms"
+        linha_diag "VisRange / CellHeight" \
+            "$(cfg .Interesse.VisRange) / $(cfg .Interesse.CellHeight)"
+        linha_diag "Save: orçamento / intervalo" \
+            "$(cfg .Save.OrcamentoMsPorFrame) ms / $(cfg .Save.IntervaloMundoSegundos) s"
 
         local inc; inc=$(cfg .Save.SaveIncremental)
         linha_diag "SaveIncremental" "$inc" \
@@ -1010,11 +1231,7 @@ acao_diagnostico() {
     fi
     linha_diag "Arquivo" "$(readlink -f "$CURRENT_LOG" | xargs basename)"
 
-    # ⚠️ Vários padrões da versão anterior NÃO existiam no código e
-    # reportavam 0 para sempre: "[WorldSave] Captura de", "reconectou
-    # pela conn", "peça(s) órfã(s)". Todos conferidos contra as strings
-    # reais emitidas pelo WorldSaveManager / PlayerPersistenceService.
-    local n ms obj wall players
+    local n ms obj wall players heap
 
     echo -e "\n  ${BOLD}Saúde do save${NC}"
     n=$(contar_re '\[WorldSave\] [0-9]+ objetos' "$CURRENT_LOG")
@@ -1023,11 +1240,13 @@ acao_diagnostico() {
     ms=$(grep -oP 'main thread \K[0-9]+(?=ms)' "$CURRENT_LOG" 2>/dev/null | tail -1)
     obj=$(grep -oP '\[WorldSave\] \K[0-9]+(?= objetos)' "$CURRENT_LOG" 2>/dev/null | tail -1)
     wall=$(grep -oP 'em \K[0-9]+(?=ms reais)' "$CURRENT_LOG" 2>/dev/null | tail -1)
+    heap=$(grep -oP 'HEAPMB = \K[0-9]+' "$CURRENT_LOG" 2>/dev/null | tail -1)
 
     linha_diag "Último save: objetos" "${obj:-?}" "$CYAN"
     linha_diag "Último save: main thread" "${ms:-?} ms" \
         "$( [[ -n "${ms:-}" && "${ms:-0}" -gt 2000 ]] && echo "$RED" || echo "$GREEN")"
     linha_diag "Último save: wall clock" "${wall:-?} ms" "$CYAN"
+    linha_diag "Heap managed (HEAPMB)" "${heap:-?} MB" "$CYAN"
 
     if [[ -n "${ms:-}" && -n "${obj:-}" && "${obj:-0}" -gt 0 ]]; then
         linha_diag "Custo por objeto" \
@@ -1049,6 +1268,18 @@ acao_diagnostico() {
     linha_diag "Verificações de escrita falhas" "$n" "$( ((n>0)) && echo "$RED" || echo "$GREEN")"
     n=$(contar "Escrita em background falhou" "$CURRENT_LOG")
     linha_diag "Escritas em background falhas" "$n" "$( ((n>0)) && echo "$RED" || echo "$GREEN")"
+
+    echo -e "\n  ${BOLD}Interest Management${NC}"
+    local aoi
+    aoi=$(grep -E '^\[AOI\] conns=' "$CURRENT_LOG" 2>/dev/null | tail -1)
+    if [[ -n "$aoi" ]]; then
+        linha_diag "Pares obj×observador" "$(grep -oP 'pares=\K[0-9]+' <<< "$aoi")" "$CYAN"
+        linha_diag "Observados por conexão (média)" "$(grep -oP 'média=\K[0-9]+' <<< "$aoi")" "$CYAN"
+        linha_diag "visRange em uso" "$(grep -oP 'visRange=\K[0-9]+' <<< "$aoi")" "$CYAN"
+        linha_diag "Pior frame do AOI" "$(grep -oP 'piorFrameAOI=\K[0-9.]+' <<< "$aoi") ms" "$CYAN"
+    else
+        linha_diag "Linhas [AOI]" "nenhuma (LogDeDiagnostico desligado?)" "$YELLOW"
+    fi
 
     echo -e "\n  ${BOLD}Corpo duplicado / sessão${NC}"
     n=$(contar "ainda está viva" "$CURRENT_LOG")
@@ -1086,6 +1317,8 @@ acao_diagnostico() {
     echo -e "\n  ${BOLD}Rede${NC}"
     players=$(grep -oP '\[AutoSave\] \K[0-9]+(?=/)' "$CURRENT_LOG" 2>/dev/null | tail -1)
     linha_diag "Players no último autosave" "${players:-?}" "$CYAN"
+    n=$(contar "Connection timed out" "$CURRENT_LOG")
+    linha_diag "Timeouts de conexão (kcp)" "$n" "$( ((n>5)) && echo "$YELLOW" || echo "$GREEN")"
     n=$(contar "because of exception" "$CURRENT_LOG")
     linha_diag "Disconnects por exceção" "$n" "$( ((n>0)) && echo "$RED" || echo "$GREEN")"
     n=$(contar "NullReferenceException" "$CURRENT_LOG")
@@ -1107,14 +1340,9 @@ acao_diagnostico() {
 #  9. VERIFICAR AMBIENTE
 # ============================================================
 
-# Na EC2 o IPv4 público é EFÊMERO: muda a cada stop/start (reboot mantém).
-# Como o master anuncia o endereço na lista de servidores e o
-# server_config.json tem IPDoServidor fixo, um IP novo significa lista
-# apontando para o vazio. Daí o Elastic IP.
-#
-# Custo: desde 2024 a AWS cobra por TODO IPv4 público (~US$3,60/mês),
-# elástico ou não. Anexado a uma instância rodando, o EIP não custa nada
-# a mais que o IP automático — só se ficar alocado e solto.
+# Confere se o IPDoServidor do config bate com o IP público real. Na EC2
+# o IPv4 público muda a cada stop/start; em VPS comum costuma ser fixo,
+# mas a checagem é barata e pega erro de digitação no config.
 verificar_ip_publico() {
     local token ip_real ip_cfg
     token=$(curl -s --max-time 2 -X PUT "http://169.254.169.254/latest/api/token" \
@@ -1142,7 +1370,6 @@ verificar_ip_publico() {
         err "IPDoServidor no config: $ip_cfg"
         err "IP público real......: $ip_real"
         warn "Os clientes não vão conseguir conectar. Corrija o config e reinicie."
-        warn "Se o IP muda a cada stop/start, anexe um Elastic IP à instância."
     else
         ok "IPDoServidor confere com o IP público ($ip_real)."
     fi
@@ -1195,7 +1422,7 @@ acao_ambiente() {
         "$(sysctl -n net.core.rmem_max 2>/dev/null) / $(sysctl -n net.core.wmem_max 2>/dev/null)"
 
     echo -e "\n${BOLD}── Relógio ──────────────────────────────────${NC}"
-    # Wipe e Raid são agendados por hora de parede. Deriva = wipe errado.
+    # Wipe, Raid e reinício programado usam hora de parede.
     linha_diag "Fuso" "$(timedatectl show -p Timezone --value 2>/dev/null)"
     linha_diag "NTP sincronizado" "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
     command -v chronyc >/dev/null 2>&1 && \
@@ -1203,8 +1430,10 @@ acao_ambiente() {
 
     echo -e "\n${BOLD}── Serviço ──────────────────────────────────${NC}"
     if [[ -f "$UNIT_PATH" ]]; then
-        linha_diag "TimeoutStopSec" \
-            "$(systemctl show -p TimeoutStopUSec --value "$SERVICE_NAME" 2>/dev/null)"
+        local tstop
+        tstop=$(systemctl show -p TimeoutStopUSec --value "$SERVICE_NAME" 2>/dev/null)
+        linha_diag "TimeoutStopSec (unit)" "$tstop"
+        linha_diag "Espera do wrapper" "${STOP_WAIT_WRAPPER}s"
         local mh
         mh=$(systemctl show -p MemoryHigh --value "$SERVICE_NAME" 2>/dev/null)
         if [[ "$mh" != "infinity" && -n "$mh" ]]; then
@@ -1214,6 +1443,7 @@ acao_ambiente() {
         fi
         linha_diag "MemoryMax" \
             "$(systemctl show -p MemoryMax --value "$SERVICE_NAME" 2>/dev/null)"
+        linha_diag "Reinício diário" "$(status_restart_timer)"
     else
         err "Unit não instalada. Rode a opção 1."
     fi
@@ -1240,6 +1470,7 @@ menu() {
         echo -e "  ${SERVER_DIR}"
         echo -e "  Estado: $(status_curto)"
         esta_rodando && resumo_recursos
+        echo -e "  Reinício diário: $(status_restart_timer)"
         echo ""
         echo "  1) Instalar / atualizar (apt, permissões, swap, sysctl, unit)"
         echo "  2) Iniciar servidor"
@@ -1250,30 +1481,33 @@ menu() {
         echo -e "  7) Backup dos saves ${YELLOW}(antes de cada deploy)${NC}"
         echo -e "  8) Diagnóstico ${CYAN}(saúde do save e da rede)${NC}"
         echo -e "  9) Verificar ambiente ${CYAN}(IP, libs, buffers, relógio)${NC}"
+        echo -e " 10) Reinício programado ${CYAN}(diário, com avisos)${NC}"
         echo "  0) Sair (servidor continua rodando)"
         echo ""
         read -r -p "  Escolha: " opt
 
         case "$opt" in
-            1) acao_instalar ;;
-            2) acao_iniciar ;;
-            3) acao_parar ;;
-            4) acao_reiniciar ;;
-            5) acao_console ;;
-            6) acao_monitor ;;
-            7) acao_backup ;;
-            8) acao_diagnostico ;;
-            9) acao_ambiente ;;
-            0) echo "Saindo. O servidor continua em segundo plano."; exit 0 ;;
-            *) warn "Opção inválida."; sleep 1 ;;
+            1)  acao_instalar ;;
+            2)  acao_iniciar ;;
+            3)  acao_parar ;;
+            4)  acao_reiniciar ;;
+            5)  acao_console ;;
+            6)  acao_monitor ;;
+            7)  acao_backup ;;
+            8)  acao_diagnostico ;;
+            9)  acao_ambiente ;;
+            10) acao_reinicio_programado ;;
+            0)  echo "Saindo. O servidor continua em segundo plano."; exit 0 ;;
+            *)  warn "Opção inválida."; sleep 1 ;;
         esac
     done
 }
 
 # ============================================================
 case "${1:-}" in
-    __run)     run_launcher ;;
-    __prompt)  run_prompt ;;
-    __tail)    run_tail ;;
-    *)         menu ;;
+    __run)      run_launcher ;;
+    __prompt)   run_prompt ;;
+    __tail)     run_tail ;;
+    __restart)  run_restart_agendado ;;
+    *)          menu ;;
 esac
