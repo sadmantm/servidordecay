@@ -8,6 +8,20 @@
 #    ./decayhub.sh __prompt   → prompt de comandos (uso interno do tmux)
 #    ./decayhub.sh __tail     → seguidor de log  (uso interno do tmux)
 #    ./decayhub.sh __restart  → reinício programado (uso interno do timer)
+#
+#  ENCERRAMENTO SEGURO
+#    O painel NÃO depende de o Unity tratar SIGTERM. Ele envia o comando
+#    de console CMD_ENCERRAR pela FIFO; o próprio jogo bloqueia conexões,
+#    salva mundo + players + corpos com o servidor ainda ativo e sai.
+#    SIGTERM e SIGKILL ficam como planos B e C, com prazos maiores que o
+#    tempo real do save.
+#
+#  COMANDOS DE CONSOLE (DedicatedServerConsole)
+#    stop [s]      salva e sai (o systemd reinicia)
+#    shutdown [s]  salva e sai com código 64 (o systemd NÃO reinicia)
+#    save          dispara save do mundo + flush dos players
+#    say <texto>   anuncia no chat
+#    status        players, FPS, heap, objetos
 # ============================================================
 
 set -u
@@ -38,20 +52,34 @@ BACKUP_RETENTION=20
 SAVE_DIRS=("WorldSaves" "PlayerSaves")
 
 # ── Timeouts de encerramento ────────────────────────────────
-# ⚠️ ERAM 10/15s. O SalvarSincrono do shutdown captura TODOS os objetos
-# do mundo com forcarRecaptura=true, roda a BFS do grafo de suporte,
-# serializa, faz fsync e RELÊ o arquivo inteiro para o SHA-256 — mais o
-# flush dos players e dos sleeping bodies, cada um com fsync próprio.
-# Com ~6 mil objetos isso passa MUITO de 10s: o systemd mandava SIGKILL
-# no meio e o save de encerramento era perdido em todo restart.
+# Sequência do encerramento (wrapper):
+#   1) envia CMD_ENCERRAR pela FIFO → o JOGO salva tudo e sai sozinho
+#   2) sem saída em STOP_WAIT_GRACIOSO s → SIGTERM (plano B)
+#   3) sem saída em mais STOP_WAIT_TERM s → SIGKILL (plano C, save perdido)
 #
-# Meça o seu:  systemctl stop decay-server && grep "Save síncrono" no log.
-# O do wrapper precisa ser MENOR que o do systemd.
+# O total do wrapper precisa ser MENOR que o TimeoutStopSec do systemd,
+# senão o systemd mata no meio da espera.
+#
+# Meça o seu: pare pela opção 3 e veja "Unity encerrou após Xs" no
+# journal (journalctl -u decay-server -n 20).
 #
 # ⚠️ Depois de mudar estes valores, rode a opção 1 (regrava a unit) e
 # confira com:  systemctl show decay-server -p TimeoutStopUSec
-STOP_WAIT_WRAPPER=120
+STOP_WAIT_GRACIOSO=100
+STOP_WAIT_TERM=15
+STOP_WAIT_WRAPPER=$(( STOP_WAIT_GRACIOSO + STOP_WAIT_TERM ))
 STOP_WAIT_SYSTEMD=150
+
+# Comando de console que faz o JOGO salvar e sair (DedicatedServerConsole).
+# 0 = sem contagem regressiva (os avisos, quando há, já foram dados antes).
+CMD_ENCERRAR="stop 0"
+
+# Código de saída do comando 'shutdown': o systemd NÃO reinicia.
+EXIT_DESLIGAR=64
+
+# Tempo máximo esperando a nova sessão liberar conexões após um reinício
+# (inclui a restauração do mundo).
+ESPERA_PRONTO_S=900
 
 # ⚠️ ERA 4096. Swap grande é o que produziu a espiral de thrashing:
 # o GC toca o heap inteiro, as páginas voltam do disco, o frame trava,
@@ -61,10 +89,6 @@ SWAP_FILE="/swapfile_decay"
 SWAP_SIZE_MB=2048
 
 # ── Reinício programado ─────────────────────────────────────
-# O RSS do processo cresce até o OOM em poucos dias (OOM em 09/10 com
-# 6,8 GB; pico de 6,6 GB em 13/10 com MemoryMax de 7,07 GB). Até o
-# vazamento ser encontrado, o reinício diário é o que evita a queda.
-#
 # Hora LOCAL do sistema (o painel define America/Sao_Paulo).
 # O reinício acontece EXATAMENTE neste horário; o timer dispara antes
 # para dar tempo aos avisos.
@@ -78,14 +102,21 @@ RESTART_AVISOS_MIN=(15 10 5 1)
 RESTART_MIN_UPTIME_H=4
 
 # Comando de CONSOLE que avisa os jogadores no chat. %d = minutos restantes.
-# ⚠️ Troque pelo comando de broadcast que o console de vocês aceita.
-#    Exemplo (se o comando se chamar 'say'):
-#      RESTART_AVISO_CMD="say Servidor reinicia em %d min para manutencao."
-#    Vazio = reinicia sem avisar.
-#    Não use '%' no texto além do %d.
-RESTART_AVISO_CMD=""
+# Sem acentos: não depende da codificação do stdin do servidor.
+# Vazio = reinicia sem avisar. Não use '%' no texto além do %d.
+RESTART_AVISO_CMD="say Servidor reinicia em %d min para manutencao. Seu progresso sera salvo."
+
+# Backup dos saves entre a parada e a subida do reinício programado.
+RESTART_COM_BACKUP=1
 
 RESTART_UNIT="decay-restart"
+
+# Lock contra dois reinícios simultâneos (timer + manual).
+if [[ -w /run ]]; then
+    RESTART_LOCK="/run/decay-restart.lock"
+else
+    RESTART_LOCK="/tmp/decay-restart.lock"
+fi
 
 # ── Cores ───────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -113,13 +144,11 @@ run_launcher() {
 
     # ── FIFO de comandos ────────────────────────────────────
     # exec 3<> abre a FIFO em LEITURA-ESCRITA num descritor do próprio
-    # bash: não bloqueia e mantém o stdin do servidor sem EOF.
+    # bash: não bloqueia e mantém o stdin do servidor sem EOF. É também
+    # por este descritor que o encerramento envia o comando de 'stop'.
     #
-    # ⚠️ A versão anterior usava 'sleep infinity > fifo &' como holder. Esse
-    # processo era filho do bash, e o 'wait' SEM ARGUMENTO espera TODOS os
-    # filhos — então quando o Unity caía por conta própria, o bash ficava
-    # preso no wait para sempre, o systemd via o processo principal vivo e
-    # NUNCA reiniciava. O Restart=always era letra morta.
+    # ⚠️ Não use um holder 'sleep infinity > fifo &': o 'wait' sem argumento
+    # espera TODOS os filhos, e o systemd nunca via o Unity cair.
     rm -f "$IN_FIFO"
     if ! mkfifo -m 660 "$IN_FIFO"; then
         echo "Falha ao criar FIFO em $IN_FIFO" >&2
@@ -129,40 +158,58 @@ run_launcher() {
 
     local SERVER_PID=""
     local ENCERRANDO=0
+    EXIT_ENCERRAR=""
 
-    # ── Encerramento gracioso ───────────────────────────────
-    # Repassa SIGTERM ao Unity e ESPERA o processo sair de verdade. Sem
-    # isso o bash saía na hora e o save de encerramento (players +
-    # sleeping bodies + world save síncrono) era cortado no meio.
+    # ── Encerramento SEGURO ─────────────────────────────────
+    # 1) pede ao JOGO para salvar e sair (comando de console pela FIFO)
+    # 2) SIGTERM se ele não sair no prazo
+    # 3) SIGKILL como último recurso
     encerrar() {
         [[ "$ENCERRANDO" == "1" ]] && return
         ENCERRANDO=1
 
         if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
-            echo "[$(date '+%F %T')] SIGTERM -> Unity (PID $SERVER_PID). " \
-                 "Aguardando até ${STOP_WAIT_WRAPPER}s pelo save final..."
-            kill -TERM "$SERVER_PID" 2>/dev/null
-
-            # Cão de guarda: mata só se estourar o prazo. O 'wait' abaixo
-            # retorna no instante em que o Unity realmente sai.
             local INICIO=$SECONDS
-            ( sleep "$STOP_WAIT_WRAPPER"; kill -KILL "$SERVER_PID" 2>/dev/null ) &
+            local PID_ALVO="$SERVER_PID"
+
+            echo "[$(date '+%F %T')] Encerramento: enviando '$CMD_ENCERRAR' ao console" \
+                 "(save completo + saída limpa). Prazo: ${STOP_WAIT_GRACIOSO}s."
+
+            # fd 3 é a própria FIFO em leitura-escrita: a escrita não bloqueia.
+            if ! printf '%s\n' "$CMD_ENCERRAR" >&3 2>/dev/null; then
+                echo "[$(date '+%F %T')] Falha ao escrever na FIFO — indo direto ao SIGTERM."
+                kill -TERM "$PID_ALVO" 2>/dev/null
+            fi
+
+            # Cão de guarda: só age se o jogo NÃO sair sozinho no prazo.
+            (
+                sleep "$STOP_WAIT_GRACIOSO"
+                if kill -0 "$PID_ALVO" 2>/dev/null; then
+                    echo "[$(date '+%F %T')] Sem saída em ${STOP_WAIT_GRACIOSO}s. SIGTERM (plano B)."
+                    kill -TERM "$PID_ALVO" 2>/dev/null
+                    sleep "$STOP_WAIT_TERM"
+                    if kill -0 "$PID_ALVO" 2>/dev/null; then
+                        echo "[$(date '+%F %T')] SIGKILL — o save final provavelmente foi perdido."
+                        kill -KILL "$PID_ALVO" 2>/dev/null
+                    fi
+                fi
+            ) &
             local CAO=$!
 
-            wait "$SERVER_PID" 2>/dev/null
-            local DECORRIDO=$(( SECONDS - INICIO ))
+            # wait COM argumento: retorna no instante em que o Unity sai.
+            wait "$PID_ALVO" 2>/dev/null
+            EXIT_ENCERRAR=$?
 
             kill "$CAO" 2>/dev/null
             wait "$CAO" 2>/dev/null
 
-            if (( DECORRIDO >= STOP_WAIT_WRAPPER )); then
-                echo "[$(date '+%F %T')] Unity NÃO saiu em ${STOP_WAIT_WRAPPER}s." \
-                     "SIGKILL — o save final provavelmente foi perdido."
-            else
-                echo "[$(date '+%F %T')] Unity encerrou após ${DECORRIDO}s."
-            fi
+            echo "[$(date '+%F %T')] Unity encerrou após $(( SECONDS - INICIO ))s" \
+                 "(exit $EXIT_ENCERRAR)."
+            SERVER_PID=""
         fi
 
+        # ⚠️ Só fecha o fd 3. Um 'exec ... 2>/dev/null' aqui redirecionaria o
+        # stderr do PRÓPRIO script para sempre.
         exec 3>&-
         rm -f "$IN_FIFO"
     }
@@ -172,14 +219,11 @@ run_launcher() {
     echo "══════════════════════════════════════════"
     echo "[$(date '+%F %T')] Iniciando Decay Server"
     echo "Log: $LOG_FILE"
-    echo "Timeout de encerramento do wrapper: ${STOP_WAIT_WRAPPER}s"
+    echo "Encerramento: '$CMD_ENCERRAR' → ${STOP_WAIT_GRACIOSO}s → SIGTERM → ${STOP_WAIT_TERM}s → SIGKILL"
     echo "══════════════════════════════════════════"
 
     # ⚠️ SEM pipeline e SEM tee: '-logFile <path>' faz o próprio Unity
-    # escrever no arquivo. Antes, '-logFile -' + 'tee' gravava cada linha
-    # DUAS vezes no disco (arquivo + journald), e o pipeline tornava a
-    # detecção de PID frágil ('jobs -p %1') e o exit code inútil (era o
-    # do tee, não o do jogo).
+    # escrever no arquivo. O pipeline tornava o PID e o exit code inúteis.
     "$APP" -batchmode -nographics -logFile "$LOG_FILE" <&3 &
     SERVER_PID=$!
 
@@ -188,9 +232,18 @@ run_launcher() {
     # wait COM argumento: retorna o exit code real do Unity.
     wait "$SERVER_PID"
     local EXIT_CODE=$?
+
+    # Se o wait foi interrompido por um sinal, o encerrar() já esperou o
+    # jogo e guardou o código real dele.
+    [[ -n "${EXIT_ENCERRAR:-}" ]] && EXIT_CODE=$EXIT_ENCERRAR
     SERVER_PID=""
 
-    echo "[$(date '+%F %T')] Servidor encerrou (exit $EXIT_CODE)."
+    if (( EXIT_CODE == EXIT_DESLIGAR )); then
+        echo "[$(date '+%F %T')] Servidor DESLIGADO por comando (exit $EXIT_CODE)" \
+             "— o systemd não vai reiniciar."
+    else
+        echo "[$(date '+%F %T')] Servidor encerrou (exit $EXIT_CODE)."
+    fi
     exit $EXIT_CODE
 }
 
@@ -242,10 +295,7 @@ pid_do_servidor() {
 # ── Thread mais quente do processo ──────────────────────────
 # Unity + Mirror rodam o loop de jogo inteiro numa ÚNICA thread. Se ela
 # está colada em ~100%, mais vCPU não resolve nada — só core mais rápido
-# ou menos trabalho por frame. É o número mais importante deste painel.
-#
-# Lê /proc/<pid>/task/*/stat direto: 'top -bH' muda de colunas entre
-# versões e quebra o parsing.
+# ou menos trabalho por frame.
 thread_mais_quente() {
     local pid="$1" hz t tid linha campos agora d
     local best=0 bestid="" bestname=""
@@ -322,6 +372,150 @@ linha_diag() {
     printf "  %-34s ${cor}%s${NC}\n" "$rotulo" "$valor"
 }
 
+# ── Envio de comando ao console do jogo ─────────────────────
+enviar_comando() {
+    local linha="$1"
+    [[ -z "$linha" ]] && return 1
+    [[ -p "$IN_FIFO" ]] || return 2
+    # timeout: sem leitor na outra ponta, a escrita bloquearia o painel.
+    timeout 2 bash -c "echo \"\$1\" > \"\$2\"" _ "$linha" "$IN_FIFO" || return 3
+    return 0
+}
+
+# ── Verificação do encerramento ─────────────────────────────
+# Confere no log de UMA sessão se o encerramento salvou.
+# Imprime um código e devolve 0 só quando o estado em disco é confiável.
+verificar_encerramento() {
+    local logf="$1"
+    [[ -n "$logf" && -f "$logf" ]] || { echo "SEM_LOG"; return 2; }
+
+    if grep -qF "Shutdown concluído" "$logf" 2>/dev/null; then
+        if grep -qE "Save síncrono FALHOU|SalvarSincrono\('.*'\) IGNORADO" "$logf" 2>/dev/null; then
+            echo "SAVE_FALHOU"; return 1
+        fi
+        if grep -qF "ABORTADO: restauração" "$logf" 2>/dev/null; then
+            # Parado antes do fim da restauração: o disco JÁ é o estado certo.
+            echo "RESTAURACAO_INCOMPLETA"; return 0
+        fi
+        echo "OK"; return 0
+    fi
+
+    echo "SEM_SHUTDOWN"; return 1
+}
+
+explicar_encerramento() {
+    case "$1" in
+        OK)                     ok "Save final confirmado (Shutdown concluído)." ;;
+        RESTAURACAO_INCOMPLETA) warn "Parado antes do fim da restauração — o save em disco foi preservado (correto)." ;;
+        SAVE_FALHOU)            err "O encerramento rodou, mas o save do MUNDO falhou. Veja o log." ;;
+        SEM_SHUTDOWN)           err "NÃO há 'Shutdown concluído' no log — o processo foi morto antes do save." ;;
+        SEM_LOG)                warn "Log da sessão não encontrado para conferir o save." ;;
+        *)                      warn "Resultado de encerramento desconhecido: $1" ;;
+    esac
+}
+
+# Espera a NOVA sessão liberar conexões. $2 = log da sessão ANTERIOR: o
+# symlink current.log só é repontado quando o launcher sobe, e até lá ainda
+# aponta para o log velho (que também contém "Conexões LIBERADAS").
+aguardar_servidor_pronto() {
+    local limite="${1:-$ESPERA_PRONTO_S}" log_anterior="${2:-}" inicio=$SECONDS logf
+    while (( SECONDS - inicio < limite )); do
+        esta_rodando || return 2
+        logf=$(readlink -f "$CURRENT_LOG" 2>/dev/null)
+        if [[ -n "$logf" && "$logf" != "$log_anterior" ]] \
+           && grep -qF "Conexões LIBERADAS" "$logf" 2>/dev/null; then
+            return 0
+        fi
+        sleep 5
+    done
+    return 1
+}
+
+# Backup dos saves. Íntegro só com o servidor PARADO.
+fazer_backup() {
+    mkdir -p "$BACKUP_DIR"
+    local existentes=() d
+    for d in "${SAVE_DIRS[@]}"; do
+        [[ -d "$SERVER_DIR/$d" ]] && existentes+=("$d")
+    done
+
+    if (( ${#existentes[@]} == 0 )); then
+        warn "Nenhuma pasta de save encontrada (esperado: ${SAVE_DIRS[*]})."
+        return 1
+    fi
+
+    local arq="$BACKUP_DIR/saves_$(date '+%Y-%m-%d_%H-%M-%S').tar.gz"
+    log "Compactando: ${existentes[*]}"
+
+    # nice/ionice: se o servidor estiver no ar, o tar não disputa a main thread.
+    if ! nice -n 19 ionice -c3 tar -czf "$arq" -C "$SERVER_DIR" "${existentes[@]}" 2>/dev/null; then
+        err "Falha ao criar o backup."
+        rm -f "$arq"
+        return 1
+    fi
+
+    # Rodando como root (timer), o arquivo nasceria do root.
+    chown "$USER_OWNER:$GROUP_OWNER" "$arq" 2>/dev/null
+
+    # Mantém só os N mais recentes.
+    local total
+    total=$(ls -1t "$BACKUP_DIR"/saves_*.tar.gz 2>/dev/null | wc -l)
+    if (( total > BACKUP_RETENTION )); then
+        ls -1t "$BACKUP_DIR"/saves_*.tar.gz | tail -n +$(( BACKUP_RETENTION + 1 )) \
+            | xargs -r rm -f
+        log "Backups antigos removidos (mantidos $BACKUP_RETENTION)."
+    fi
+
+    ok "Backup: $arq ($(du -h "$arq" | cut -f1))"
+    return 0
+}
+
+# Reinício SEGURO: para (save confirmado) → backup → sobe → espera pronto.
+# Usado pelo reinício manual e pelo programado.
+reiniciar_seguro() {
+    local origem="$1" com_backup="${2:-1}"
+    local SUDO; SUDO=$(precisa_sudo)
+
+    local log_anterior
+    log_anterior=$(readlink -f "$CURRENT_LOG" 2>/dev/null)
+
+    log "($origem) Parando — o save final pode levar até ${STOP_WAIT_WRAPPER}s. NÃO interrompa."
+    local inicio=$SECONDS
+    $SUDO systemctl stop "$SERVICE_NAME"
+    log "($origem) Parado em $(( SECONDS - inicio ))s."
+
+    if esta_rodando; then
+        err "($origem) O serviço ainda está ativo após o stop. Abortando o reinício."
+        return 1
+    fi
+
+    local resultado
+    resultado=$(verificar_encerramento "$log_anterior")
+    explicar_encerramento "$resultado"
+
+    # Backup SEMPRE com o servidor parado: arquivos estáveis e consistentes.
+    # Mesmo com o save final falho, o backup guarda o último estado bom.
+    if [[ "$com_backup" == "1" ]]; then
+        fazer_backup || warn "($origem) Seguindo sem backup."
+    fi
+
+    log "($origem) Iniciando..."
+    $SUDO systemctl start "$SERVICE_NAME"
+
+    log "($origem) Aguardando a restauração do mundo (até $(( ESPERA_PRONTO_S / 60 )) min)..."
+    if aguardar_servidor_pronto "$ESPERA_PRONTO_S" "$log_anterior"; then
+        ok "($origem) Servidor pronto e aceitando jogadores ($(( SECONDS - inicio ))s no total)."
+        return 0
+    fi
+
+    if esta_rodando; then
+        warn "($origem) Servidor ativo, mas ainda não liberou conexões. Veja o log."
+    else
+        err "($origem) O servidor NÃO subiu. Veja o diagnóstico (8)."
+    fi
+    return 1
+}
+
 # ============================================================
 #  DEPENDÊNCIAS DO SISTEMA
 # ============================================================
@@ -342,16 +536,15 @@ acao_dependencias() {
     log "Instalando dependências..."
     $SUDO apt-get install -y -qq --no-install-recommends \
         ca-certificates curl wget jq tar unzip xz-utils \
-        tmux procps psmisc lsof iproute2 \
+        tmux procps psmisc lsof iproute2 util-linux \
         libc6 libstdc++6 libgcc-s1 zlib1g \
         vnstat sysstat htop logrotate tzdata chrony \
         || err "Falha ao instalar dependências."
 
     # ── Relógio ─────────────────────────────────────────────
     # Wipe, Raid e o reinício programado são agendados por hora de
-    # parede. Deriva de relógio = evento na hora errada. Na EC2, o Amazon
-    # Time Sync fica no endereço de link-local abaixo; fora da AWS ele
-    # simplesmente não responde e o chrony usa os servidores padrão.
+    # parede. Na EC2, o Amazon Time Sync fica no endereço de link-local
+    # abaixo; fora da AWS ele não responde e o chrony usa os padrões.
     if [[ -f /etc/chrony/chrony.conf ]] \
        && ! grep -q '169.254.169.123' /etc/chrony/chrony.conf; then
         echo 'server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4' \
@@ -362,9 +555,7 @@ acao_dependencias() {
     $SUDO timedatectl set-timezone America/Sao_Paulo 2>/dev/null
 
     # ── Reboot automático ───────────────────────────────────
-    # As imagens Ubuntu vêm com unattended-upgrades ativo. Um reboot
-    # automático às 3h da manhã no meio de um raid é bem capaz de
-    # acontecer. Atualizar tudo bem; reiniciar sozinho, não.
+    # Atualizar tudo bem; reiniciar a máquina sozinho no meio de um raid, não.
     echo 'Unattended-Upgrade::Automatic-Reboot "false";' \
         | $SUDO tee /etc/apt/apt.conf.d/99-decay-no-reboot >/dev/null
 
@@ -506,6 +697,13 @@ avisar_reinicio() {
 
 # Modo __restart: executado pelo decay-restart.service (disparado pelo timer).
 run_restart_agendado() {
+    # Impede dois reinícios simultâneos (timer + manual, ou timer duplicado).
+    exec 9>"$RESTART_LOCK"
+    if ! flock -n 9; then
+        echo "[$(date '+%F %T')] Outro reinício já está em andamento. Saindo."
+        exit 0
+    fi
+
     echo "[$(date '+%F %T')] Reinício programado iniciado."
 
     if ! esta_rodando; then
@@ -537,12 +735,15 @@ run_restart_agendado() {
     local rss_mb=0 pid
     pid=$(pid_do_servidor)
     [[ -n "$pid" ]] && rss_mb=$(( $(ps -o rss= -p "$pid" 2>/dev/null || echo 0) / 1024 ))
+    echo "[$(date '+%F %T')] Reiniciando após $(( up / 3600 ))h no ar (RSS ${rss_mb} MB)."
 
-    echo "[$(date '+%F %T')] Reiniciando após $(( up / 3600 ))h no ar" \
-         "(RSS ${rss_mb} MB). Aguardando o save final..."
-    local INICIO=$SECONDS
-    systemctl restart "$SERVICE_NAME"
-    echo "[$(date '+%F %T')] Reinício concluído em $(( SECONDS - INICIO ))s."
+    if reiniciar_seguro "agendado" "$RESTART_COM_BACKUP"; then
+        echo "[$(date '+%F %T')] Reinício programado concluído com sucesso."
+        exit 0
+    fi
+
+    echo "[$(date '+%F %T')] Reinício programado terminou COM PROBLEMAS — verifique o log."
+    exit 1
 }
 
 instalar_restart_timer() {
@@ -558,12 +759,12 @@ instalar_restart_timer() {
     disparo=$(date -d "$RESTART_HORARIO $lead minutes ago" '+%H:%M' 2>/dev/null) \
         || { err "Não consegui calcular o horário de disparo."; return 1; }
 
-    # Avisos + o próprio stop (até STOP_WAIT_SYSTEMD) + folga.
-    local timeout_min=$(( lead + STOP_WAIT_SYSTEMD / 60 + 10 ))
+    # Avisos + stop (até STOP_WAIT_SYSTEMD) + backup + subida/restauração + folga.
+    local timeout_min=$(( lead + STOP_WAIT_SYSTEMD / 60 + ESPERA_PRONTO_S / 60 + 10 ))
 
     $SUDO tee "/etc/systemd/system/$RESTART_UNIT.service" >/dev/null <<EOF
 [Unit]
-Description=Decay - reinício programado (avisos + restart)
+Description=Decay - reinício programado (avisos + save + backup + restart)
 
 [Service]
 Type=oneshot
@@ -618,7 +819,8 @@ acao_reinicio_programado() {
     echo ""
     echo -e "  Config (topo do script): ${BOLD}$RESTART_HORARIO${NC}" \
             "· avisos: ${RESTART_AVISOS_MIN[*]:-nenhum} min" \
-            "· uptime mínimo: ${RESTART_MIN_UPTIME_H}h"
+            "· uptime mínimo: ${RESTART_MIN_UPTIME_H}h" \
+            "· backup: $( [[ "$RESTART_COM_BACKUP" == "1" ]] && echo sim || echo não )"
     if [[ -z "$RESTART_AVISO_CMD" ]]; then
         echo -e "  Aviso no chat: ${YELLOW}desligado${NC} (RESTART_AVISO_CMD vazio)"
     else
@@ -626,11 +828,25 @@ acao_reinicio_programado() {
     fi
     echo ""
     echo -e "    ${GREEN}i${NC}) instalar / atualizar (relê as variáveis do topo do script)"
+    echo -e "    ${GREEN}t${NC}) testar AGORA (avisos + save + backup + restart)"
     echo -e "    ${GREEN}r${NC}) remover"
     echo -e "    ${GREEN}l${NC}) log das últimas execuções"
     read -r -p "  Escolha [voltar]: " op
     case "${op:-}" in
         i|I) instalar_restart_timer ;;
+        t|T)
+            if [[ ! -f "/etc/systemd/system/$RESTART_UNIT.service" ]]; then
+                err "Instale primeiro (opção i)."
+            else
+                warn "Isto reinicia o servidor de verdade, com os avisos configurados."
+                warn "O uptime mínimo de ${RESTART_MIN_UPTIME_H}h continua valendo."
+                read -r -p "  Confirmar? [s/N]: " r
+                if [[ "${r,,}" == "s" ]]; then
+                    local SUDO; SUDO=$(precisa_sudo)
+                    $SUDO systemctl start --no-block "$RESTART_UNIT.service"
+                    ok "Disparado. Acompanhe com: journalctl -u $RESTART_UNIT -f"
+                fi
+            fi ;;
         r|R) remover_restart_timer ;;
         l|L) journalctl -u "$RESTART_UNIT.service" -n 40 --no-pager 2>/dev/null \
                  || warn "Sem execuções registradas." ;;
@@ -664,11 +880,9 @@ acao_instalar() {
     config_sysctl
 
     # ── MemoryMax dimensionado pela máquina ─────────────────
-    # ⚠️ A versão anterior usava MemoryHigh=2500M. MemoryHigh não é um
-    # teto: ao ultrapassá-lo o cgroup entra em RECLAIM AGRESSIVO e o
-    # kernel despeja páginas do processo para o swap. O GC toca nelas na
-    # frame seguinte e elas voltam — thrashing criado por configuração,
-    # com RAM sobrando na máquina. Agora só um teto de segurança.
+    # Sem MemoryHigh: ao ultrapassá-lo o cgroup entra em RECLAIM AGRESSIVO
+    # e o kernel despeja páginas do processo para o swap — thrashing criado
+    # por configuração. MemoryMax é só um teto de segurança.
     local MEM_TOTAL_MB MEM_MAX_MB
     MEM_TOTAL_MB=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)
     MEM_MAX_MB=$(( MEM_TOTAL_MB * 85 / 100 ))
@@ -681,8 +895,7 @@ After=network-online.target
 Wants=network-online.target
 
 # ⚠️ StartLimit* pertence a [Unit], NÃO a [Service]. Na seção errada o
-# systemd IGNORA as duas, e um bug de startup viraria crash loop
-# reiniciando a cada 10s indefinidamente.
+# systemd IGNORA as duas e um bug de startup vira crash loop infinito.
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -696,15 +909,19 @@ ExecStart=$SELF __run
 Restart=always
 RestartSec=10
 
-# 'mixed' só é seguro porque o wrapper repassa o SIGTERM ao Unity e
-# ESPERA o processo sair. TimeoutStopSec > o do wrapper, senão o systemd
+# 'shutdown' no console sai com $EXIT_DESLIGAR: desliga de verdade, sem
+# reinício automático. 'stop' sai com 0 e o Restart=always sobe de novo.
+SuccessExitStatus=$EXIT_DESLIGAR
+RestartPreventExitStatus=$EXIT_DESLIGAR
+
+# O SIGTERM vai SÓ para o wrapper (mixed). O wrapper pede ao jogo para
+# salvar e sair pelo console, e só usa SIGTERM/SIGKILL no jogo se ele
+# não responder. TimeoutStopSec > o total do wrapper, senão o systemd
 # mata no meio da espera e o save de encerramento se perde.
 KillSignal=SIGTERM
 KillMode=mixed
 TimeoutStopSec=$STOP_WAIT_SYSTEMD
 
-# Sem MemoryHigh (ver comentário no acao_instalar). MemoryMax é só rede
-# de segurança contra um pico anômalo — bem acima do platô normal.
 MemoryAccounting=yes
 MemoryMax=${MEM_MAX_MB}M
 OOMScoreAdjust=-500
@@ -712,8 +929,7 @@ OOMScoreAdjust=-500
 LimitNOFILE=65535
 
 # O Unity escreve o log direto no arquivo (-logFile). O journald recebe
-# só as linhas do wrapper, então 'systemctl status' fica legível e o
-# disco não leva a mesma linha duas vezes.
+# só as linhas do wrapper.
 StandardOutput=journal
 StandardError=journal
 
@@ -724,7 +940,8 @@ EOF
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 
-    ok "Unit instalada (TimeoutStopSec=${STOP_WAIT_SYSTEMD}s, wrapper ${STOP_WAIT_WRAPPER}s)."
+    ok "Unit instalada (TimeoutStopSec=${STOP_WAIT_SYSTEMD}s, wrapper ${STOP_WAIT_WRAPPER}s," \
+       "shutdown=exit $EXIT_DESLIGAR sem reinício)."
 
     echo ""
     read -r -p "  Configurar o reinício diário programado ($RESTART_HORARIO)? [S/n]: " r
@@ -736,9 +953,9 @@ EOF
 
     if (( estava_rodando )); then
         warn "O serviço está rodando com a unit ANTIGA."
-        warn "O novo timeout de encerramento só vale depois de reiniciar."
-        read -r -p "  Reiniciar agora para aplicar? [s/N]: " r
-        [[ "${r,,}" == "s" ]] && { $SUDO systemctl restart "$SERVICE_NAME"; ok "Reiniciado."; }
+        warn "O novo encerramento seguro só vale depois de reiniciar."
+        read -r -p "  Reiniciar agora (com save, backup e espera)? [s/N]: " r
+        [[ "${r,,}" == "s" ]] && reiniciar_seguro "instalação" 1
     fi
     pausar
 }
@@ -749,11 +966,29 @@ EOF
 acao_iniciar() {
     if esta_rodando; then
         warn "Já está rodando."
-    else
-        local SUDO; SUDO=$(precisa_sudo)
-        $SUDO systemctl start "$SERVICE_NAME"
-        sleep 2
-        esta_rodando && ok "Servidor iniciado." || err "Falhou — veja o diagnóstico (8)."
+        pausar; return
+    fi
+
+    local SUDO; SUDO=$(precisa_sudo)
+    local log_anterior
+    log_anterior=$(readlink -f "$CURRENT_LOG" 2>/dev/null)
+
+    $SUDO systemctl start "$SERVICE_NAME"
+    sleep 2
+    if ! esta_rodando; then
+        err "Falhou — veja o diagnóstico (8)."
+        pausar; return
+    fi
+
+    ok "Servidor iniciado."
+    read -r -p "  Aguardar a restauração do mundo terminar? [S/n]: " r
+    if [[ "${r,,}" != "n" ]]; then
+        log "Aguardando 'Conexões LIBERADAS' (até $(( ESPERA_PRONTO_S / 60 )) min)..."
+        if aguardar_servidor_pronto "$ESPERA_PRONTO_S" "$log_anterior"; then
+            ok "Servidor pronto e aceitando jogadores."
+        else
+            warn "Ainda não liberou conexões. Acompanhe pelo console (5)."
+        fi
     fi
     pausar
 }
@@ -764,64 +999,70 @@ acao_parar() {
         pausar; return
     fi
     local SUDO; SUDO=$(precisa_sudo)
-    log "Parando... o save de encerramento pode levar até ${STOP_WAIT_WRAPPER}s. NÃO interrompa."
+    local log_anterior
+    log_anterior=$(readlink -f "$CURRENT_LOG" 2>/dev/null)
 
+    log "Parando... o save final pode levar até ${STOP_WAIT_WRAPPER}s. NÃO interrompa."
     local INICIO=$SECONDS
     $SUDO systemctl stop "$SERVICE_NAME"
-    local DECORRIDO=$(( SECONDS - INICIO ))
 
-    esta_rodando && err "Ainda rodando?" || ok "Servidor parado em ${DECORRIDO}s."
-
-    # Confirmação pelo log do próprio WorldSaveManager, que sempre emite
-    # a linha do save síncrono. Um marcador customizado só serve se ele
-    # existir mesmo no código — se você adicionar um, troque aqui.
-    if grep -qE "Save síncrono \(bloqueante\)|SalvarSincrono" "$CURRENT_LOG" 2>/dev/null; then
-        ok "Save síncrono de encerramento encontrado no log."
-        grep -E "Save síncrono \(bloqueante\)" "$CURRENT_LOG" | tail -n1 | sed 's/^/    /'
+    if esta_rodando; then
+        err "Ainda rodando?"
     else
-        err "NÃO encontrei o save síncrono no log da sessão."
-        warn "Se o encerramento levou perto de ${STOP_WAIT_WRAPPER}s, o SIGKILL cortou o save."
-        warn "Aumente STOP_WAIT_WRAPPER/STOP_WAIT_SYSTEMD no topo deste script."
+        ok "Servidor parado em $(( SECONDS - INICIO ))s."
     fi
 
-    if grep -qF "SUPRIMIDO — wipe em andamento" "$CURRENT_LOG" 2>/dev/null; then
+    explicar_encerramento "$(verificar_encerramento "$log_anterior")"
+
+    if grep -qF "SUPRIMIDO — wipe em andamento" "$log_anterior" 2>/dev/null; then
         warn "Saves foram SUPRIMIDOS por wipe em andamento nesta sessão."
     fi
     pausar
 }
 
 acao_reiniciar() {
-    local SUDO; SUDO=$(precisa_sudo)
     if esta_rodando; then
         warn "Jogadores conectados serão desconectados."
-        warn "O save de encerramento pode levar até ${STOP_WAIT_WRAPPER}s."
+        warn "O save final pode levar até ${STOP_WAIT_WRAPPER}s."
         read -r -p "  Confirmar reinício? [s/N]: " r
         [[ "${r,,}" != "s" ]] && { log "Cancelado."; pausar; return; }
+
+        local com_backup=1
+        read -r -p "  Fazer backup dos saves entre a parada e a subida? [S/n]: " b
+        [[ "${b,,}" == "n" ]] && com_backup=0
+
+        # Mesmo lock do reinício programado: não roda os dois juntos.
+        exec 9>"$RESTART_LOCK"
+        if ! flock -n 9; then
+            err "Um reinício programado está em andamento. Aguarde."
+            exec 9>&-
+            pausar; return
+        fi
+
+        reiniciar_seguro "manual" "$com_backup"
+        exec 9>&-
+    else
+        local SUDO; SUDO=$(precisa_sudo)
+        local log_anterior
+        log_anterior=$(readlink -f "$CURRENT_LOG" 2>/dev/null)
+        $SUDO systemctl start "$SERVICE_NAME"
+        if aguardar_servidor_pronto "$ESPERA_PRONTO_S" "$log_anterior"; then
+            ok "Servidor pronto."
+        else
+            warn "Servidor iniciado; acompanhe a restauração pelo console (5)."
+        fi
     fi
-    log "Reiniciando (aguardando o save final)..."
-    local INICIO=$SECONDS
-    $SUDO systemctl restart "$SERVICE_NAME"
-    sleep 2
-    esta_rodando && ok "Reiniciado em $(( SECONDS - INICIO ))s." \
-                 || err "Falhou — veja o diagnóstico (8)."
     pausar
 }
 
 # ============================================================
 #  5. CONSOLE + LOGS
 # ============================================================
-enviar_comando() {
-    local linha="$1"
-    [[ -z "$linha" ]] && return 1
-    [[ -p "$IN_FIFO" ]] || return 2
-    # timeout: sem leitor na outra ponta, a escrita bloquearia o painel.
-    timeout 2 bash -c "echo \"\$1\" > \"\$2\"" _ "$linha" "$IN_FIFO" || return 3
-    return 0
-}
-
 run_prompt() {
     echo -e "${BOLD}Console do servidor Decay${NC}"
-    echo -e "Ex.: ${GREEN}adminset Joao true${NC} · ${GREEN}players${NC}"
+    echo -e "Jogo:      ${GREEN}adminset Joao true${NC} · ${GREEN}players${NC}"
+    echo -e "Servidor:  ${GREEN}status${NC} · ${GREEN}save${NC} · ${GREEN}say <texto>${NC}" \
+            "· ${GREEN}stop [s]${NC} (reinicia) · ${GREEN}shutdown [s]${NC} (desliga)"
     echo -e "Sair do painel: ${YELLOW}Ctrl+B${NC} depois ${YELLOW}D${NC} (servidor segue rodando)."
     echo ""
     while true; do
@@ -865,9 +1106,7 @@ acao_console() {
         pausar; return
     fi
 
-    # A FIFO é criada com -m 660: só o dono e o grupo escrevem. Abrir o
-    # painel com um usuário diferente do serviço dava "escrita expirou"
-    # sem explicar o motivo. Testa antes de abrir o tmux.
+    # A FIFO é criada com -m 660: só o dono e o grupo escrevem.
     if [[ ! -w "$IN_FIFO" ]]; then
         err "Sem permissão de escrita na FIFO."
         warn "O serviço roda como '$USER_OWNER' e você é '$(id -un)'."
@@ -893,8 +1132,7 @@ acao_console() {
     log "Abrindo console + logs. Ctrl+B depois D para desanexar."
     sleep 1
 
-    # __tail reabre o arquivo quando o symlink current.log é repontado
-    # (restart do servidor). O 'tail -F' cru ficava preso no log antigo.
+    # __tail reabre o arquivo quando o symlink current.log é repontado.
     tmux new-session -d -s "$TMUX_SESSION" -n decay "'$SELF' __tail"
     tmux split-window -v -t "$TMUX_SESSION" "'$SELF' __prompt"
     tmux resize-pane -t "$TMUX_SESSION".0 -y 70%
@@ -922,7 +1160,7 @@ uso_cpu_total() {
     echo "$pct $steal"
 }
 
-# Taxa de rede em KB/s (a acumulada desde o boot não dizia nada útil).
+# Taxa de rede em KB/s.
 rede_taxa() {
     local r1 t1 r2 t2
     read -r r1 t1 < <(awk -F'[: ]+' 'NR>2 && $2!="lo" {r+=$3; t+=$11} END{print r, t}' /proc/net/dev)
@@ -975,7 +1213,6 @@ render_monitor() {
                 fi
             fi
 
-            # ── O número que decide tudo ────────────────────
             local tpct tname
             read -r tpct tname _ < <(thread_mais_quente "$pid")
             printf "  Thread + quente: %5s%% (%s)  %b\n" "$tpct" "$tname" "$(barra_pct "$tpct")"
@@ -1035,10 +1272,10 @@ render_monitor() {
         printf "  Disco..........: %s / %s (%s)  %b\n" "$du" "$ds" "$dp" "$(barra_pct "${dp%\%}")"
     fi
     printf "  Logs...........: %s\n" "$(du -sh "$LOG_DIR" 2>/dev/null | cut -f1 || echo '?')"
+    printf "  Backups........: %s\n" "$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1 || echo '?')"
     printf "  Rede...........: %s\n" "$(rede_taxa)"
 
-    # Descartes de UDP por buffer cheio: o contador é desde o boot, então
-    # o que importa é se ele está SUBINDO entre duas leituras.
+    # Descartes de UDP por buffer cheio: o que importa é se está SUBINDO.
     local rcvbuf
     rcvbuf=$(awk '/^Udp:/{n++} n==2 && /^Udp:/{print $6; exit}' /proc/net/snmp 2>/dev/null)
     [[ -n "${rcvbuf:-}" ]] && printf "  UDP RcvbufErrors: %s (desde o boot; compare entre leituras)\n" "$rcvbuf"
@@ -1073,50 +1310,20 @@ acao_monitor() {
 #  7. BACKUP DOS SAVES
 # ============================================================
 acao_backup() {
-    mkdir -p "$BACKUP_DIR"
-    local existentes=() d
-    for d in "${SAVE_DIRS[@]}"; do
-        [[ -d "$SERVER_DIR/$d" ]] && existentes+=("$d")
-    done
-
-    if (( ${#existentes[@]} == 0 )); then
-        err "Nenhuma pasta de save encontrada em $SERVER_DIR"
-        warn "Esperado: ${SAVE_DIRS[*]}. O servidor já rodou e salvou ao menos uma vez?"
-        pausar; return
-    fi
-
     if esta_rodando; then
-        warn "Servidor RODANDO: o tar pode pegar o world save no meio da rotação."
-        echo -e "  Alternativa íntegra: a pasta ${GREEN}WorldSaves/Rotacao/${NC} guarda"
-        echo -e "  arquivos já promovidos e verificados por SHA-256."
+        warn "Servidor RODANDO: o tar pode pegar um save no meio da escrita."
+        echo -e "  O backup ${BOLD}íntegro${NC} acontece sozinho no reinício (opção 4 ou o programado),"
+        echo -e "  com o servidor parado entre o save final e a subida."
+        echo -e "  Alternativa: a pasta ${GREEN}WorldSaves/Rotacao/${NC} guarda saves já promovidos."
         read -r -p "  Continuar mesmo assim? [s/N]: " r
         [[ "${r,,}" != "s" ]] && { log "Cancelado."; pausar; return; }
     fi
 
-    local arq="$BACKUP_DIR/saves_$(date '+%Y-%m-%d_%H-%M-%S').tar.gz"
-    log "Compactando: ${existentes[*]}"
-
-    # nice/ionice: um tar de dezenas de MB compete diretamente com a
-    # main thread do Unity.
-    if nice -n 19 ionice -c3 tar -czf "$arq" -C "$SERVER_DIR" "${existentes[@]}" 2>/dev/null; then
-        ok "Backup: $arq ($(du -h "$arq" | cut -f1))"
-    else
-        err "Falha ao criar o backup."
-        pausar; return
-    fi
-
-    # Mantém só os N mais recentes.
-    local total
-    total=$(ls -1t "$BACKUP_DIR"/saves_*.tar.gz 2>/dev/null | wc -l)
-    if (( total > BACKUP_RETENTION )); then
-        ls -1t "$BACKUP_DIR"/saves_*.tar.gz | tail -n +$(( BACKUP_RETENTION + 1 )) \
-            | xargs -r rm -f
-        log "Backups antigos removidos (mantidos $BACKUP_RETENTION)."
-    fi
+    fazer_backup
 
     echo ""
     echo -e "  Restaurar manualmente (${BOLD}com o servidor PARADO${NC}):"
-    echo -e "    ${GREEN}tar -xzf $arq -C $SERVER_DIR${NC}"
+    echo -e "    ${GREEN}tar -xzf <arquivo> -C $SERVER_DIR${NC}"
     pausar
 }
 
@@ -1135,18 +1342,6 @@ acao_diagnostico() {
     if [[ -f "$ws" ]]; then
         linha_diag "world_transforms.json" \
             "$(du -h "$ws" | cut -f1), $(date -r "$ws" '+%F %H:%M:%S')"
-
-        # O manifesto .meta.json já traz contagem, schema e SHA-256. Um
-        # grep -o em arquivo escrito com Formatting.None percorre uma
-        # linha única de dezenas de MB por nada.
-        if [[ -f "$ws.meta.json" ]] && tem_jq; then
-            linha_diag "Objetos no save (manifesto)" "$(jq -r .contagem "$ws.meta.json")"
-            linha_diag "Schema / SHA-256" \
-                "v$(jq -r .schemaVersion "$ws.meta.json") · $(jq -r .sha256 "$ws.meta.json" | cut -c1-12)…"
-            linha_diag "Gravado em" "$(jq -r .savedUtcIso "$ws.meta.json" | cut -c1-19) UTC"
-        else
-            linha_diag "Manifesto .meta.json" "ausente" "$YELLOW"
-        fi
     else
         linha_diag "world_transforms.json" "AUSENTE" "$RED"
     fi
@@ -1159,12 +1354,8 @@ acao_diagnostico() {
     rot=$(find "$SERVER_DIR/WorldSaves/Rotacao" -type f 2>/dev/null | wc -l)
     linha_diag "Arquivos na rotação" "$rot" "$( ((rot>0)) && echo "$GREEN" || echo "$YELLOW")"
 
-    local emerg="$ws.emergencia"
-    [[ -f "$emerg" ]] && linha_diag "Save de EMERGÊNCIA presente" \
-        "$(date -r "$emerg" '+%F %H:%M') — houve SIGKILL" "$RED"
-
     local tmps
-    tmps=$(find "$SERVER_DIR" -name "*.tmp" 2>/dev/null | wc -l)
+    tmps=$(find "$SERVER_DIR/WorldSaves" "$SERVER_DIR/PlayerSaves" -name "*.tmp" 2>/dev/null | wc -l)
     (( tmps > 0 )) \
         && linha_diag ".tmp órfãos (crash na escrita)" "$tmps" "$RED" \
         || linha_diag ".tmp órfãos" "0"
@@ -1179,9 +1370,35 @@ acao_diagnostico() {
             || linha_diag "Saves corrompidos" "0"
     fi
 
+    local ultimo_bkp
+    ultimo_bkp=$(ls -1t "$BACKUP_DIR"/saves_*.tar.gz 2>/dev/null | head -n1)
+    if [[ -n "$ultimo_bkp" ]]; then
+        linha_diag "Último backup" "$(basename "$ultimo_bkp") ($(du -h "$ultimo_bkp" | cut -f1))"
+    else
+        linha_diag "Último backup" "nenhum" "$YELLOW"
+    fi
+
     # ── Encerramentos recentes ──────────────────────────────
     echo -e "\n${BOLD}── Encerramentos recentes ───────────────────${NC}"
-    local kills
+
+    # Sessão ANTERIOR: é ela que diz se o último encerramento salvou.
+    local log_ant
+    log_ant=$(ls -1t "$LOG_DIR"/server_*.log 2>/dev/null | sed -n 2p)
+    if [[ -n "$log_ant" ]]; then
+        local res
+        res=$(verificar_encerramento "$log_ant")
+        local cor=$GREEN
+        [[ "$res" == "SAVE_FALHOU" || "$res" == "SEM_SHUTDOWN" ]] && cor=$RED
+        linha_diag "Último encerramento" "$res ($(basename "$log_ant"))" "$cor"
+    else
+        linha_diag "Último encerramento" "sem sessão anterior" "$YELLOW"
+    fi
+
+    local termos kills
+    termos=$(journalctl -u "$SERVICE_NAME" --since "-7 days" --no-pager 2>/dev/null \
+            | grep -c "SIGTERM (plano B)")
+    linha_diag "SIGTERM de fallback (7 dias)" "${termos:-0}" \
+        "$( (( ${termos:-0} > 0 )) && echo "$YELLOW" || echo "$GREEN")"
     kills=$(journalctl -u "$SERVICE_NAME" --since "-7 days" --no-pager 2>/dev/null \
             | grep -c "SIGKILL — o save final")
     linha_diag "SIGKILL no encerramento (7 dias)" "${kills:-0}" \
@@ -1190,6 +1407,14 @@ acao_diagnostico() {
     ooms=$(dmesg -T 2>/dev/null | grep -c "Killed process.*$APP_NAME")
     linha_diag "OOM kills (desde o boot)" "${ooms:-0}" \
         "$( (( ${ooms:-0} > 0 )) && echo "$RED" || echo "$GREEN")"
+
+    local rest_ok rest_falha
+    rest_ok=$(journalctl -u "$RESTART_UNIT.service" --since "-7 days" --no-pager 2>/dev/null \
+            | grep -c "concluído com sucesso")
+    rest_falha=$(journalctl -u "$RESTART_UNIT.service" --since "-7 days" --no-pager 2>/dev/null \
+            | grep -c "COM PROBLEMAS")
+    linha_diag "Reinícios programados ok / falha" "${rest_ok:-0} / ${rest_falha:-0}" \
+        "$( (( ${rest_falha:-0} > 0 )) && echo "$RED" || echo "$GREEN")"
 
     # ── Config efetiva ──────────────────────────────────────
     if tem_jq && [[ -f "$CONFIG_JSON" ]]; then
@@ -1209,7 +1434,7 @@ acao_diagnostico() {
         linha_diag "SaveIncremental" "$inc" \
             "$( [[ "$inc" == "true" ]] && echo "$YELLOW" || echo "$NC")"
         [[ "$inc" == "true" ]] && \
-            warn "  Só é seguro se o gameplay chama RegistrarMutacao() em TODA mutação."
+            warn "  Só é seguro se toda mutação chama NotificarMutacao/NotificarMutacaoLeve."
 
         local wh wm
         wh=$(cfg .Wipe.Habilitado); wm=$(cfg .Wipe.ModoSimulacao)
@@ -1232,6 +1457,18 @@ acao_diagnostico() {
     linha_diag "Arquivo" "$(readlink -f "$CURRENT_LOG" | xargs basename)"
 
     local n ms obj wall players heap
+
+    echo -e "\n  ${BOLD}Inicialização${NC}"
+    if grep -qF "Conexões LIBERADAS" "$CURRENT_LOG" 2>/dev/null; then
+        linha_diag "Restauração do mundo" \
+            "$(grep -oP 'Restauração concluída em \K[0-9.]+s' "$CURRENT_LOG" | tail -1) — conexões liberadas" "$GREEN"
+    else
+        linha_diag "Restauração do mundo" "em andamento (conexões bloqueadas)" "$YELLOW"
+    fi
+    n=$(contar "stdin ENCERRADO" "$CURRENT_LOG")
+    linha_diag "Console (stdin) funcional" \
+        "$( ((n>0)) && echo "NÃO — encerramento seguro indisponível" || echo "sim")" \
+        "$( ((n>0)) && echo "$RED" || echo "$GREEN")"
 
     echo -e "\n  ${BOLD}Saúde do save${NC}"
     n=$(contar_re '\[WorldSave\] [0-9]+ objetos' "$CURRENT_LOG")
@@ -1268,6 +1505,8 @@ acao_diagnostico() {
     linha_diag "Verificações de escrita falhas" "$n" "$( ((n>0)) && echo "$RED" || echo "$GREEN")"
     n=$(contar "Escrita em background falhou" "$CURRENT_LOG")
     linha_diag "Escritas em background falhas" "$n" "$( ((n>0)) && echo "$RED" || echo "$GREEN")"
+    n=$(contar "Captura falhou em" "$CURRENT_LOG")
+    linha_diag "Falhas de captura de objeto" "$n" "$( ((n>0)) && echo "$YELLOW" || echo "$GREEN")"
 
     echo -e "\n  ${BOLD}Interest Management${NC}"
     local aoi
@@ -1279,6 +1518,13 @@ acao_diagnostico() {
         linha_diag "Pior frame do AOI" "$(grep -oP 'piorFrameAOI=\K[0-9.]+' <<< "$aoi") ms" "$CYAN"
     else
         linha_diag "Linhas [AOI]" "nenhuma (LogDeDiagnostico desligado?)" "$YELLOW"
+    fi
+
+    local join
+    join=$(grep -E '^\[Join\]' "$CURRENT_LOG" 2>/dev/null | tail -1)
+    if [[ -n "$join" ]]; then
+        linha_diag "Última entrada de jogador" \
+            "$(grep -oP 'AddPlayerForConnection \K[0-9.]+ ms' <<< "$join") · visíveis=$(grep -oP 'visíveis=\K[0-9]+' <<< "$join")" "$CYAN"
     fi
 
     echo -e "\n  ${BOLD}Corpo duplicado / sessão${NC}"
@@ -1302,6 +1548,8 @@ acao_diagnostico() {
     linha_diag "Prefabs ausentes (assetId)" "$n" "$( ((n>0)) && echo "$RED" || echo "$GREEN")"
     n=$(contar "REVERTIDA" "$CURRENT_LOG")
     linha_diag "Transferências de loot revertidas" "$n" "$( ((n>0)) && echo "$YELLOW" || echo "$GREEN")"
+    n=$(contar "não existe mais no servidor" "$CURRENT_LOG")
+    linha_diag "Playtime: conexões órfãs" "$n" "$( ((n>0)) && echo "$YELLOW" || echo "$GREEN")"
 
     echo -e "\n  ${BOLD}Configuração${NC}"
     n=$(contar "FALHA ao ler" "$CURRENT_LOG")
@@ -1340,11 +1588,9 @@ acao_diagnostico() {
 #  9. VERIFICAR AMBIENTE
 # ============================================================
 
-# Confere se o IPDoServidor do config bate com o IP público real. Na EC2
-# o IPv4 público muda a cada stop/start; em VPS comum costuma ser fixo,
-# mas a checagem é barata e pega erro de digitação no config.
+# Confere se o IPDoServidor do config bate com o IP público real.
 verificar_ip_publico() {
-    local token ip_real ip_cfg
+    local token ip_real="" ip_cfg
     token=$(curl -s --max-time 2 -X PUT "http://169.254.169.254/latest/api/token" \
             -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null)
     if [[ -n "$token" ]]; then
@@ -1401,10 +1647,8 @@ acao_ambiente() {
         warn "Nada escutando em UDP $porta (servidor parado?)."
     fi
 
-    # ── Buffer CONCEDIDO x pedido ───────────────────────────
-    # O Inspector do KcpTransport mostra o que foi PEDIDO. Isto mostra o
-    # que o kernel realmente deu. Se vierem diferentes, o processo subiu
-    # antes do sysctl e precisa de restart.
+    # Buffer CONCEDIDO x pedido: se diferentes, o processo subiu antes do
+    # sysctl e precisa de restart.
     local rb pedido
     rb=$(ss -uanm 2>/dev/null | grep -A1 ":$porta" | grep -oP 'rb\K[0-9]+' | head -1)
     pedido=$(cfg .Rede.KcpRecvBufferSize)
@@ -1422,7 +1666,6 @@ acao_ambiente() {
         "$(sysctl -n net.core.rmem_max 2>/dev/null) / $(sysctl -n net.core.wmem_max 2>/dev/null)"
 
     echo -e "\n${BOLD}── Relógio ──────────────────────────────────${NC}"
-    # Wipe, Raid e reinício programado usam hora de parede.
     linha_diag "Fuso" "$(timedatectl show -p Timezone --value 2>/dev/null)"
     linha_diag "NTP sincronizado" "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
     command -v chronyc >/dev/null 2>&1 && \
@@ -1430,10 +1673,21 @@ acao_ambiente() {
 
     echo -e "\n${BOLD}── Serviço ──────────────────────────────────${NC}"
     if [[ -f "$UNIT_PATH" ]]; then
-        local tstop
+        local tstop rpe
         tstop=$(systemctl show -p TimeoutStopUSec --value "$SERVICE_NAME" 2>/dev/null)
         linha_diag "TimeoutStopSec (unit)" "$tstop"
-        linha_diag "Espera do wrapper" "${STOP_WAIT_WRAPPER}s"
+        linha_diag "Espera do wrapper" \
+            "${STOP_WAIT_GRACIOSO}s (console) + ${STOP_WAIT_TERM}s (SIGTERM) = ${STOP_WAIT_WRAPPER}s"
+        (( STOP_WAIT_WRAPPER >= STOP_WAIT_SYSTEMD )) && \
+            warn "  Wrapper (${STOP_WAIT_WRAPPER}s) >= systemd (${STOP_WAIT_SYSTEMD}s): o systemd mataria antes."
+
+        rpe=$(systemctl show -p RestartPreventExitStatus --value "$SERVICE_NAME" 2>/dev/null)
+        if [[ "$rpe" == *"$EXIT_DESLIGAR"* ]]; then
+            linha_diag "Comando 'shutdown' (exit $EXIT_DESLIGAR)" "desliga sem reiniciar" "$GREEN"
+        else
+            linha_diag "Comando 'shutdown' (exit $EXIT_DESLIGAR)" "unit antiga — rode a opção 1" "$YELLOW"
+        fi
+
         local mh
         mh=$(systemctl show -p MemoryHigh --value "$SERVICE_NAME" 2>/dev/null)
         if [[ "$mh" != "infinity" && -n "$mh" ]]; then
@@ -1474,8 +1728,8 @@ menu() {
         echo ""
         echo "  1) Instalar / atualizar (apt, permissões, swap, sysctl, unit)"
         echo "  2) Iniciar servidor"
-        echo "  3) Parar servidor (aguarda o save final)"
-        echo "  4) Reiniciar servidor"
+        echo "  3) Parar servidor (save final confirmado)"
+        echo "  4) Reiniciar servidor (save + backup + espera ficar pronto)"
         echo -e "  5) Console + Logs ${GREEN}(tmux)${NC}"
         echo "  6) Status & Monitor"
         echo -e "  7) Backup dos saves ${YELLOW}(antes de cada deploy)${NC}"
