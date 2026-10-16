@@ -12,7 +12,6 @@ Library: C:\Users\teteu\DecayProject\Temp\BurstOutput\Data\Plugins\lib_burst_gen
 --float-mode=Fast
 --generate-link-xml=Temp\burst.link.xml
 --temp-folder=C:\Users\teteu\DecayProject\Temp\Burst
---debug=Full
 --enable-frame-info-registration
 --key-folder=C:/Program Files/Unity/Hub/Editor/6000.3.20f1/Editor/Data/PlaybackEngines/LinuxStandaloneSupport
 --decode-folder=C:\Users\teteu\DecayProject\Library\Burst
@@ -34,7 +33,6 @@ Library: C:\Users\teteu\DecayProject\Temp\BurstOutput\Data\Plugins\lib_burst_gen
 --float-mode=Fast
 --generate-link-xml=Temp\burst.link.xml
 --temp-folder=C:\Users\teteu\DecayProject\Temp\Burst
---debug=Full
 --enable-frame-info-registration
 --key-folder=C:/Program Files/Unity/Hub/Editor/6000.3.20f1/Editor/Data/PlaybackEngines/LinuxStandaloneSupport
 --decode-folder=C:\Users\teteu\DecayProject\Library\Burst
@@ -54,7 +52,6 @@ Library: C:\Users\teteu\DecayProject\Temp\BurstOutput\Data\Plugins\lib_burst_gen
 --target-framework=NetFramework
 --generate-link-xml=Temp\burst.link.xml
 --temp-folder=C:\Users\teteu\DecayProject\Temp\Burst
---debug=Full
 --enable-frame-info-registration
 --key-folder=C:/Program Files/Unity/Hub/Editor/6000.3.20f1/Editor/Data/PlaybackEngines/LinuxStandaloneSupport
 --decode-folder=C:\Users\teteu\DecayProject\Library\Burst
@@ -158,7 +155,6 @@ Library: C:\Users\teteu\DecayProject\Temp\BurstOutput\Data\Plugins\lib_burst_gen
 --target-framework=NetFramework
 --generate-link-xml=Temp\burst.link.xml
 --temp-folder=C:\Users\teteu\DecayProject\Temp\Burst
---debug=Full
 --enable-frame-info-registration
 --key-folder=C:/Program Files/Unity/Hub/Editor/6000.3.20f1/Editor/Data/PlaybackEngines/LinuxStandaloneSupport
 --decode-folder=C:\Users\teteu\DecayProject\Library\Burst
