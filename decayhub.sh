@@ -9,6 +9,19 @@
 #    ./decayhub.sh __tail     → seguidor de log  (uso interno do tmux)
 #    ./decayhub.sh __restart  → reinício programado (uso interno do timer)
 #
+#  MÚLTIPLAS INSTÂNCIAS
+#    Cada instância é uma CÓPIA da pasta do servidor (build + config +
+#    saves) com este mesmo script dentro. O script descobre sozinho
+#    quem ele é:
+#      • a pasta da unit decay-server.service é a instância "principal"
+#        (nomes antigos: decay-server, decay-restart, decay_console);
+#      • outra pasta vira "decay-server-<nome>", com porta, FIFO, logs,
+#        saves, backups, tmux, timer e lock próprios.
+#    Ao abrir o painel numa pasta copiada, um assistente pede o nome,
+#    troca a porta e limpa o que veio na cópia (logs, FIFO, saves).
+#    Ao iniciar com outra instância no ar, o painel pergunta se é para
+#    rodar JUNTO (porta diferente) ou PARAR a outra.
+#
 #  ENCERRAMENTO SEGURO
 #    O painel NÃO depende de o Unity tratar SIGTERM. Ele envia o comando
 #    de console CMD_ENCERRAR pela FIFO; o próprio jogo bloqueia conexões,
@@ -32,7 +45,6 @@ USER_OWNER="$(stat -c '%U' "$SERVER_DIR" 2>/dev/null || id -un)"
 GROUP_OWNER="$(stat -c '%G' "$SERVER_DIR" 2>/dev/null || id -gn)"
 
 APP_NAME="decay.x86_64"
-SERVICE_NAME="decay-server"
 
 APP="$SERVER_DIR/$APP_NAME"
 CONFIG_JSON="$SERVER_DIR/server_config.json"
@@ -41,15 +53,46 @@ BACKUP_DIR="$SERVER_DIR/backups"
 CURRENT_LOG="$LOG_DIR/current.log"
 IN_FIFO="$SERVER_DIR/.server_in.fifo"
 SELF="$(readlink -f "$0")"
-UNIT_PATH="/etc/systemd/system/$SERVICE_NAME.service"
 SYSCTL_PATH="/etc/sysctl.d/99-decay.conf"
-TMUX_SESSION="decay_console"
 
 LOG_RETENTION_DAYS=14
 BACKUP_RETENTION=20
 
 # Pastas de save geradas pelo jogo (irmãs de <app>_Data).
 SAVE_DIRS=("WorldSaves" "PlayerSaves")
+
+# ── Instâncias ──────────────────────────────────────────────
+# Prefixos dos nomes. A instância "principal" usa os nomes sem sufixo
+# (compatível com a instalação antiga); as demais ganham "-<nome>".
+SYSTEMD_DIR="/etc/systemd/system"
+SERVICE_BASE="decay-server"
+RESTART_BASE="decay-restart"
+TMUX_BASE="decay_console"
+
+# Marcador desta pasta: guarda o nome da instância.
+INSTANCIA_FILE="$SERVER_DIR/.decay_instancia"
+
+# Porta que o jogo usa quando o server_config.json não define outra.
+PORTA_PADRAO=3000
+
+# Teto de memória SOMADO de todas as instâncias (% da RAM). Com 2
+# instâncias, cada uma recebe metade. MEMORY_MAX_MB fixa um valor só
+# para ESTA instância (vazio = automático).
+MEM_MAX_PCT_TOTAL=85
+MEMORY_MAX_MB=""
+
+# Definidos por aplicar_nomes_instancia() depois da detecção.
+INSTANCIA=""
+INSTANCIA_ORIGEM=""
+SERVICE_NAME=""
+UNIT_PATH=""
+RESTART_UNIT=""
+TMUX_SESSION=""
+
+# Lock contra dois reinícios simultâneos (timer + manual). Fica na pasta
+# da instância: o painel (usuário) e o timer (root) enxergam o MESMO
+# arquivo, e cada instância tem o seu.
+RESTART_LOCK="$SERVER_DIR/.restart.lock"
 
 # ── Timeouts de encerramento ────────────────────────────────
 # Sequência do encerramento (wrapper):
@@ -61,10 +104,10 @@ SAVE_DIRS=("WorldSaves" "PlayerSaves")
 # senão o systemd mata no meio da espera.
 #
 # Meça o seu: pare pela opção 3 e veja "Unity encerrou após Xs" no
-# journal (journalctl -u decay-server -n 20).
+# journal (journalctl -u <serviço> -n 20).
 #
 # ⚠️ Depois de mudar estes valores, rode a opção 1 (regrava a unit) e
-# confira com:  systemctl show decay-server -p TimeoutStopUSec
+# confira com:  systemctl show <serviço> -p TimeoutStopUSec
 STOP_WAIT_GRACIOSO=100
 STOP_WAIT_TERM=15
 STOP_WAIT_WRAPPER=$(( STOP_WAIT_GRACIOSO + STOP_WAIT_TERM ))
@@ -85,6 +128,7 @@ ESPERA_PRONTO_S=900
 # o GC toca o heap inteiro, as páginas voltam do disco, o frame trava,
 # o kcp para de tickar e TODOS os clientes estouram o timeout juntos.
 # Aqui swap é rede de segurança contra OOM, não memória de trabalho.
+# (Global: é compartilhado por todas as instâncias da máquina.)
 SWAP_FILE="/swapfile_decay"
 SWAP_SIZE_MB=2048
 
@@ -92,6 +136,9 @@ SWAP_SIZE_MB=2048
 # Hora LOCAL do sistema (o painel define America/Sao_Paulo).
 # O reinício acontece EXATAMENTE neste horário; o timer dispara antes
 # para dar tempo aos avisos.
+#
+# Com várias instâncias, ESCALONE os horários (ex.: 06:00 e 06:30):
+# save + backup + restauração simultâneos disputam disco e CPU.
 RESTART_HORARIO="06:00"
 
 # Minutos de antecedência dos avisos, em ordem DECRESCENTE. () = sem aviso.
@@ -109,15 +156,6 @@ RESTART_AVISO_CMD="say Servidor reinicia em %d min para manutencao. Seu progress
 # Backup dos saves entre a parada e a subida do reinício programado.
 RESTART_COM_BACKUP=1
 
-RESTART_UNIT="decay-restart"
-
-# Lock contra dois reinícios simultâneos (timer + manual).
-if [[ -w /run ]]; then
-    RESTART_LOCK="/run/decay-restart.lock"
-else
-    RESTART_LOCK="/tmp/decay-restart.lock"
-fi
-
 # ── Cores ───────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -126,6 +164,113 @@ log()  { echo -e "${CYAN}[$(date '+%H:%M:%S')]${NC} $*"; }
 ok()   { echo -e "${GREEN}✔ $*${NC}"; }
 warn() { echo -e "${YELLOW}⚠ $*${NC}"; }
 err()  { echo -e "${RED}✘ $*${NC}"; }
+
+# ============================================================
+#  IDENTIFICAÇÃO DA INSTÂNCIA
+# ============================================================
+
+# Nome da unit do jogo para uma instância.
+unit_de_instancia() {
+    if [[ "$1" == "principal" ]]; then
+        echo "$SERVICE_BASE"
+    else
+        echo "$SERVICE_BASE-$1"
+    fi
+}
+
+# Nome da instância a partir do arquivo da unit.
+nome_da_unit() {
+    local b="${1%.service}"
+    if [[ "$b" == "$SERVICE_BASE" ]]; then
+        echo "principal"
+    else
+        echo "${b#"$SERVICE_BASE"-}"
+    fi
+}
+
+# Todas as instâncias INSTALADAS na máquina: "nome|pasta" por linha.
+listar_instancias() {
+    local f nome dir
+    for f in "$SYSTEMD_DIR/$SERVICE_BASE.service" "$SYSTEMD_DIR/$SERVICE_BASE"-*.service; do
+        [[ -f "$f" ]] || continue
+        nome=$(nome_da_unit "$(basename "$f")")
+        dir=$(sed -n 's/^WorkingDirectory=//p' "$f" | head -n1)
+        printf '%s|%s\n' "$nome" "$dir"
+    done
+}
+
+# Instâncias instaladas que NÃO são esta pasta.
+outras_instancias() {
+    local nome dir
+    while IFS='|' read -r nome dir; do
+        [[ -n "$INSTANCIA" && "$nome" == "$INSTANCIA" ]] && continue
+        [[ -n "$dir" && "$(readlink -f "$dir" 2>/dev/null)" == "$SERVER_DIR" ]] && continue
+        printf '%s|%s\n' "$nome" "$dir"
+    done < <(listar_instancias)
+}
+
+# Descobre quem é esta pasta. Ordem:
+#   1) uma unit aponta para esta pasta      → é ela (autoritativo)
+#   2) marcador .decay_instancia            → vale, SALVO se a unit com
+#      aquele nome aponta para OUTRA pasta  → marcador veio na cópia
+#   3) nenhuma instância na máquina         → "principal"
+#   4) caso contrário                       → cópia não configurada
+resolver_instancia() {
+    INSTANCIA=""; INSTANCIA_ORIGEM=""
+    local nome dir marcado=""
+
+    while IFS='|' read -r nome dir; do
+        if [[ -n "$dir" && "$(readlink -f "$dir" 2>/dev/null)" == "$SERVER_DIR" ]]; then
+            INSTANCIA="$nome"; INSTANCIA_ORIGEM="unit"
+            return 0
+        fi
+    done < <(listar_instancias)
+
+    [[ -f "$INSTANCIA_FILE" ]] && marcado=$(sed -n 's/^NOME=//p' "$INSTANCIA_FILE" | head -n1)
+    if [[ -n "$marcado" ]]; then
+        if [[ -f "$SYSTEMD_DIR/$(unit_de_instancia "$marcado").service" ]]; then
+            INSTANCIA_ORIGEM="copia"
+            return 1
+        fi
+        INSTANCIA="$marcado"; INSTANCIA_ORIGEM="marcador"
+        return 0
+    fi
+
+    if [[ -z "$(listar_instancias)" ]]; then
+        INSTANCIA="principal"; INSTANCIA_ORIGEM="primeira"
+        return 0
+    fi
+
+    INSTANCIA_ORIGEM="copia"
+    return 1
+}
+
+aplicar_nomes_instancia() {
+    SERVICE_NAME=$(unit_de_instancia "$INSTANCIA")
+    UNIT_PATH="$SYSTEMD_DIR/$SERVICE_NAME.service"
+    if [[ "$INSTANCIA" == "principal" ]]; then
+        RESTART_UNIT="$RESTART_BASE"
+        TMUX_SESSION="$TMUX_BASE"
+    else
+        RESTART_UNIT="$RESTART_BASE-$INSTANCIA"
+        TMUX_SESSION="${TMUX_BASE}_$INSTANCIA"
+    fi
+}
+
+gravar_marcador() {
+    printf 'NOME=%s\n' "$INSTANCIA" > "$INSTANCIA_FILE" 2>/dev/null || return 1
+    chown "$USER_OWNER:$GROUP_OWNER" "$INSTANCIA_FILE" 2>/dev/null
+    return 0
+}
+
+# Abre o lock de reinício no fd 9 (leitura basta para o flock).
+abrir_lock() {
+    [[ -e "$RESTART_LOCK" ]] || {
+        : > "$RESTART_LOCK" 2>/dev/null
+        chown "$USER_OWNER:$GROUP_OWNER" "$RESTART_LOCK" 2>/dev/null
+    }
+    exec 9<"$RESTART_LOCK"
+}
 
 # ============================================================
 #  MODO LANÇADOR (systemd: decayhub.sh __run)
@@ -217,7 +362,8 @@ run_launcher() {
     trap encerrar EXIT
 
     echo "══════════════════════════════════════════"
-    echo "[$(date '+%F %T')] Iniciando Decay Server"
+    echo "[$(date '+%F %T')] Iniciando Decay Server — instância '$INSTANCIA'"
+    echo "Pasta: $SERVER_DIR · porta (config): $(porta_atual)"
     echo "Log: $LOG_FILE"
     echo "Encerramento: '$CMD_ENCERRAR' → ${STOP_WAIT_GRACIOSO}s → SIGTERM → ${STOP_WAIT_TERM}s → SIGKILL"
     echo "══════════════════════════════════════════"
@@ -250,7 +396,9 @@ run_launcher() {
 # ============================================================
 #  HELPERS
 # ============================================================
-esta_rodando() { systemctl is-active --quiet "$SERVICE_NAME"; }
+esta_rodando() {
+    [[ -n "$SERVICE_NAME" ]] && systemctl is-active --quiet "$SERVICE_NAME"
+}
 
 precisa_sudo() { [[ $EUID -ne 0 ]] && echo "sudo"; }
 
@@ -258,9 +406,11 @@ tem_jq() { command -v jq >/dev/null 2>&1; }
 
 # O ServerConfig grava um header /* ... */ antes do JSON. O Newtonsoft
 # ignora comentários; o jq NÃO. Esta função entrega só o JSON.
+# $1 = arquivo (padrão: o config desta instância).
 ler_config() {
-    [[ -f "$CONFIG_JSON" ]] || return 1
-    sed '/^\/\*/,/^\*\//d' "$CONFIG_JSON"
+    local f="${1:-$CONFIG_JSON}"
+    [[ -f "$f" ]] || return 1
+    sed '/^\/\*/,/^\*\//d' "$f"
 }
 
 cfg() {
@@ -268,28 +418,69 @@ cfg() {
     ler_config 2>/dev/null | jq -r "$1 // empty" 2>/dev/null
 }
 
+# Lê um campo do config de OUTRA pasta.
+cfg_de() {
+    local f="$1" filtro="$2"
+    tem_jq || { echo ""; return; }
+    ler_config "$f" 2>/dev/null | jq -r "$filtro // empty" 2>/dev/null
+}
+
+porta_atual() {
+    local p; p=$(cfg .Porta)
+    echo "${p:-$PORTA_PADRAO}"
+}
+
+porta_de_dir() {
+    local p; p=$(cfg_de "$1/server_config.json" .Porta)
+    echo "${p:-$PORTA_PADRAO}"
+}
+
+# Edita o server_config.json preservando o header /* */.
+# Uso: editar_config '<filtro jq>' [--arg nome valor ...]
+# ⚠️ Só com o servidor PARADO: o jogo regrava o config e desfaria a edição.
+editar_config() {
+    local filtro="$1"; shift
+    [[ -f "$CONFIG_JSON" ]] || { err "server_config.json ausente."; return 1; }
+    tem_jq || { err "jq não instalado (rode a opção 1)."; return 1; }
+
+    local header json tmp="$CONFIG_JSON.tmp.$$"
+    header=$(sed -n '/^\/\*/,/^\*\//p' "$CONFIG_JSON")
+    json=$(ler_config | jq "$@" "$filtro" 2>/dev/null) || { err "Falha ao editar o JSON."; return 1; }
+    [[ -n "$json" ]] || { err "jq devolveu vazio — config não alterado."; return 1; }
+
+    cp -p "$CONFIG_JSON" "$CONFIG_JSON.bak" 2>/dev/null
+    if ! { [[ -n "$header" ]] && printf '%s\n' "$header"; printf '%s\n' "$json"; } > "$tmp"; then
+        rm -f "$tmp"; err "Falha ao gravar o config."; return 1
+    fi
+    mv -f "$tmp" "$CONFIG_JSON"
+    chown "$USER_OWNER:$GROUP_OWNER" "$CONFIG_JSON" "$CONFIG_JSON.bak" 2>/dev/null
+    return 0
+}
+
 status_curto() {
     if esta_rodando; then
         echo -e "${GREEN}● RODANDO${NC}"
-    elif systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+    elif [[ -n "$SERVICE_NAME" ]] && systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
         echo -e "${YELLOW}○ PARADO${NC} (habilitado no boot)"
-    elif [[ -f "$UNIT_PATH" ]]; then
+    elif [[ -n "$UNIT_PATH" && -f "$UNIT_PATH" ]]; then
         echo -e "${YELLOW}○ PARADO${NC}"
     else
         echo -e "${RED}✘ NÃO INSTALADO${NC}"
     fi
 }
 
-# PID do processo do JOGO. Prefere descer a partir do MainPID do systemd
-# em vez de um pgrep solto pela linha de comando.
+# PID do processo do JOGO. Desce a partir do MainPID do systemd (o
+# wrapper) em vez de um pgrep solto pela linha de comando.
+# $1 = unit (padrão: esta instância) · $2 = executável (padrão: $APP)
 pid_do_servidor() {
-    local main filho
-    main=$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null)
+    local unit="${1:-$SERVICE_NAME}" app="${2:-$APP}" main="" filho
+    [[ -n "$unit" ]] && main=$(systemctl show -p MainPID --value "$unit" 2>/dev/null)
     if [[ -n "$main" && "$main" != "0" ]]; then
         filho=$(pgrep -P "$main" 2>/dev/null | head -n1)
         [[ -n "$filho" ]] && { echo "$filho"; return; }
     fi
-    pgrep -f "$APP" 2>/dev/null | head -n1
+    # Âncora no início da linha de comando: outra pasta não casa.
+    pgrep -f -- "^${app}( |\$)" 2>/dev/null | head -n1
 }
 
 # ── Thread mais quente do processo ──────────────────────────
@@ -479,7 +670,7 @@ reiniciar_seguro() {
     local log_anterior
     log_anterior=$(readlink -f "$CURRENT_LOG" 2>/dev/null)
 
-    log "($origem) Parando — o save final pode levar até ${STOP_WAIT_WRAPPER}s. NÃO interrompa."
+    log "($origem) Parando '$INSTANCIA' — o save final pode levar até ${STOP_WAIT_WRAPPER}s. NÃO interrompa."
     local inicio=$SECONDS
     $SUDO systemctl stop "$SERVICE_NAME"
     log "($origem) Parado em $(( SECONDS - inicio ))s."
@@ -514,6 +705,421 @@ reiniciar_seguro() {
         err "($origem) O servidor NÃO subiu. Veja o diagnóstico (8)."
     fi
     return 1
+}
+
+# ============================================================
+#  PORTAS E CONVIVÊNCIA ENTRE INSTÂNCIAS
+# ============================================================
+
+# Alguma coisa na máquina escuta nessa porta UDP?
+porta_em_uso_sistema() {
+    ss -uanl 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
+}
+
+# Nome da outra instância cujo config usa a porta $1 (vazio se nenhuma).
+instancia_com_porta() {
+    local p="$1" n d
+    while IFS='|' read -r n d; do
+        [[ "$(porta_de_dir "$d")" == "$p" ]] && { echo "$n"; return 0; }
+    done < <(outras_instancias)
+    return 1
+}
+
+# Conflito que IMPEDE subir agora: outra instância RODANDO na mesma porta,
+# ou outro processo qualquer escutando nela. Imprime a descrição.
+conflito_porta() {
+    local p="$1" n d
+    while IFS='|' read -r n d; do
+        [[ "$(porta_de_dir "$d")" == "$p" ]] || continue
+        if systemctl is-active --quiet "$(unit_de_instancia "$n")"; then
+            echo "instância '$n' (rodando)"
+            return 0
+        fi
+    done < <(outras_instancias)
+    if ! esta_rodando && porta_em_uso_sistema "$p"; then
+        echo "outro processo desta máquina (veja: ss -uanlp | grep :$p)"
+        return 0
+    fi
+    return 1
+}
+
+# Porta em uso no sistema OU reservada no config de outra instância.
+porta_ocupada() {
+    porta_em_uso_sistema "$1" && return 0
+    instancia_com_porta "$1" >/dev/null && return 0
+    return 1
+}
+
+sugerir_porta() {
+    local p=$(( ${1:-$PORTA_PADRAO} + 1 )) lim
+    lim=$(( p + 200 ))
+    while (( p < lim )); do
+        porta_ocupada "$p" || { echo "$p"; return 0; }
+        (( p++ ))
+    done
+    return 1
+}
+
+lembrete_firewall() {
+    local p="$1" SUDO; SUDO=$(precisa_sudo)
+    warn "Libere UDP $p no Security Group / firewall do provedor."
+    if command -v ufw >/dev/null 2>&1 \
+       && $SUDO ufw status 2>/dev/null | grep -q "^Status: active"; then
+        if ! $SUDO ufw status 2>/dev/null | grep -qE "^$p(/udp)?[[:space:]]"; then
+            read -r -p "  ufw está ativo e sem regra para $p/udp. Liberar agora? [S/n]: " r
+            if [[ "${r,,}" != "n" ]]; then
+                $SUDO ufw allow "$p/udp" >/dev/null && ok "ufw: $p/udp liberada."
+            fi
+        fi
+    fi
+}
+
+# Troca a porta desta instância. $1 = sugestão (padrão: próxima livre).
+trocar_porta_interativo() {
+    if esta_rodando; then
+        err "Pare esta instância antes de trocar a porta (o jogo regrava o config)."
+        return 1
+    fi
+    [[ -f "$CONFIG_JSON" ]] || { err "server_config.json ausente nesta pasta."; return 1; }
+
+    local atual sug np
+    atual=$(porta_atual)
+    sug="${1:-$(sugerir_porta "$atual")}"
+
+    read -r -p "  Porta UDP desta instância [${sug:-?}]: " np
+    np="${np:-$sug}"
+
+    if [[ ! "$np" =~ ^[1-9][0-9]*$ ]] || (( np < 1024 || np > 65535 )); then
+        err "Porta inválida: '$np' (use 1024-65535)."
+        return 1
+    fi
+    if [[ "$np" == "$atual" ]]; then
+        if porta_ocupada "$np"; then
+            err "A porta $np continua em conflito."
+            return 1
+        fi
+        ok "Porta mantida: $np."
+        return 0
+    fi
+    if porta_ocupada "$np"; then
+        local dona; dona=$(instancia_com_porta "$np")
+        err "Porta $np já está em uso${dona:+ pela instância '$dona'}."
+        return 1
+    fi
+
+    editar_config '.Porta = ($p|tonumber)' --arg p "$np" || return 1
+    ok "Porta: $atual → $np (cópia anterior em server_config.json.bak)."
+    lembrete_firewall "$np"
+    return 0
+}
+
+trocar_nome_servidor() {
+    [[ -f "$CONFIG_JSON" ]] && tem_jq || { warn "Sem config ou sem jq."; return 1; }
+    if esta_rodando; then
+        err "Pare esta instância antes de editar o config."
+        return 1
+    fi
+    local atual novo n d repetido=""
+    atual=$(cfg .NomeDoServidor)
+    while IFS='|' read -r n d; do
+        [[ -n "$atual" && "$(cfg_de "$d/server_config.json" .NomeDoServidor)" == "$atual" ]] \
+            && repetido="$n"
+    done < <(outras_instancias)
+    [[ -n "$repetido" ]] && warn "NomeDoServidor '$atual' é igual ao da instância '$repetido'."
+
+    read -r -p "  NomeDoServidor [${atual:-?}]: " novo
+    [[ -z "$novo" || "$novo" == "$atual" ]] && { log "Nome mantido."; return 0; }
+    editar_config '.NomeDoServidor = $n' --arg n "$novo" && ok "NomeDoServidor: $novo"
+}
+
+# Antes de subir: garante que a porta desta instância está livre.
+garantir_porta_livre() {
+    local p c dona
+    while true; do
+        p=$(porta_atual)
+        c=$(conflito_porta "$p") || break
+        err "A porta UDP $p já está em uso por: $c"
+        read -r -p "  Trocar a porta desta instância? [S/n]: " r
+        [[ "${r,,}" == "n" ]] && return 1
+        trocar_porta_interativo || return 1
+    done
+
+    dona=$(instancia_com_porta "$p")
+    [[ -n "$dona" ]] && warn "A instância '$dona' (parada) usa a mesma porta $p — as duas não poderão rodar juntas."
+    return 0
+}
+
+aviso_capacidade() {
+    local n="$1" cores disp
+    cores=$(nproc 2>/dev/null || echo 1)
+    disp=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)
+    log "Ficarão $n servidores rodando · ${cores} núcleos · ${disp} MB de RAM disponível agora."
+    if (( n >= cores )); then
+        warn "Cada servidor ocupa ~1 núcleo inteiro na main thread. Com $n servidores em $cores"
+        warn "núcleos, eles vão disputar CPU e o tick de TODOS cai junto."
+    fi
+}
+
+# Para OUTRA instância com save confirmado.
+parar_instancia_externa() {
+    local n="$1" d="$2" u SUDO log_ant
+    SUDO=$(precisa_sudo); u=$(unit_de_instancia "$n")
+    log_ant=$(readlink -f "$d/logs/current.log" 2>/dev/null)
+
+    log "Parando '$n' ($u) — o save final pode levar alguns minutos. NÃO interrompa."
+    local inicio=$SECONDS
+    $SUDO systemctl stop "$u"
+    if systemctl is-active --quiet "$u"; then
+        err "'$n' continua ativa."
+        return 1
+    fi
+    ok "'$n' parada em $(( SECONDS - inicio ))s."
+    explicar_encerramento "$(verificar_encerramento "$log_ant")"
+
+    read -r -p "  Desabilitar '$n' no boot também? [s/N]: " r
+    if [[ "${r,,}" == "s" ]]; then
+        $SUDO systemctl disable "$u" >/dev/null 2>&1 && ok "'$n' não sobe mais no boot."
+    fi
+    return 0
+}
+
+# Checagens antes de iniciar ESTA instância. 0 = pode subir.
+preparar_inicio() {
+    if [[ ! -f "$CONFIG_JSON" && -n "$(outras_instancias)" ]]; then
+        warn "server_config.json ausente: o jogo vai gerar um com a porta padrão ($PORTA_PADRAO),"
+        warn "que pode ser a mesma de outra instância."
+        read -r -p "  Iniciar mesmo assim? [s/N]: " r
+        [[ "${r,,}" == "s" ]] || return 1
+    fi
+
+    local rodando=() n d item
+    while IFS='|' read -r n d; do
+        systemctl is-active --quiet "$(unit_de_instancia "$n")" && rodando+=("$n|$d")
+    done < <(outras_instancias)
+
+    if (( ${#rodando[@]} > 0 )); then
+        echo ""
+        warn "Já há servidor Decay rodando nesta máquina:"
+        for item in "${rodando[@]}"; do
+            n=${item%%|*}; d=${item#*|}
+            echo -e "    ${GREEN}●${NC} $n · porta $(porta_de_dir "$d") · $d"
+        done
+        local alvo="a outra"; (( ${#rodando[@]} > 1 )) && alvo="as outras"
+        echo ""
+        echo -e "    ${GREEN}1${NC}) Rodar JUNTO — '$INSTANCIA' como instância adicional (porta própria)"
+        echo -e "    ${GREEN}2${NC}) PARAR $alvo (com save) e iniciar só '$INSTANCIA'"
+        echo -e "    ${GREEN}0${NC}) Cancelar"
+        read -r -p "  Escolha [1]: " r
+        case "${r:-1}" in
+            1) aviso_capacidade $(( ${#rodando[@]} + 1 )) ;;
+            2) for item in "${rodando[@]}"; do
+                   parar_instancia_externa "${item%%|*}" "${item#*|}" || return 1
+               done ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    garantir_porta_livre
+}
+
+# Tabela das instâncias instaladas. $1 = "rss" para incluir memória.
+tabela_instancias() {
+    local com_rss="${1:-}" n d u st cor p marca pid rss linhas=0
+    if [[ "$com_rss" == "rss" ]]; then
+        printf "  ${BOLD}%-12s %-7s %-9s %-9s %s${NC}\n" "INSTÂNCIA" "PORTA" "ESTADO" "RSS" "PASTA"
+    else
+        printf "  ${BOLD}%-12s %-7s %-9s %s${NC}\n" "INSTÂNCIA" "PORTA" "ESTADO" "PASTA"
+    fi
+    while IFS='|' read -r n d; do
+        u=$(unit_de_instancia "$n")
+        if systemctl is-active --quiet "$u"; then st="rodando"; cor=$GREEN
+        else st="parada"; cor=$YELLOW; fi
+        p=$(porta_de_dir "$d")
+        marca=""; [[ "$n" == "$INSTANCIA" ]] && marca=" ${CYAN}← esta${NC}"
+        if [[ "$com_rss" == "rss" ]]; then
+            rss="-"
+            if [[ "$st" == "rodando" ]]; then
+                pid=$(pid_do_servidor "$u" "$d/$APP_NAME")
+                [[ -n "$pid" ]] && rss="$(( $(ps -o rss= -p "$pid" 2>/dev/null || echo 0) / 1024 ))MB"
+            fi
+            printf "  %-12s %-7s %b%-9s%b %-9s %s%b\n" "$n" "$p" "$cor" "$st" "$NC" "$rss" "$d" "$marca"
+        else
+            printf "  %-12s %-7s %b%-9s%b %s%b\n" "$n" "$p" "$cor" "$st" "$NC" "$d" "$marca"
+        fi
+        (( linhas++ ))
+    done < <(listar_instancias)
+    (( linhas > 0 )) || echo "  (nenhuma instalada)"
+}
+
+# Linha compacta com as outras instâncias (cabeçalho do menu).
+resumo_outras_instancias() {
+    local n d txt=""
+    while IFS='|' read -r n d; do
+        if systemctl is-active --quiet "$(unit_de_instancia "$n")"; then
+            txt+="${GREEN}●${NC} $n :$(porta_de_dir "$d")   "
+        else
+            txt+="${YELLOW}○${NC} $n :$(porta_de_dir "$d")   "
+        fi
+    done < <(outras_instancias)
+    [[ -n "$txt" ]] && echo -e "  Outras:  $txt"
+}
+
+# ============================================================
+#  ASSISTENTE: PASTA COPIADA → NOVA INSTÂNCIA
+# ============================================================
+limpar_residuos_copia() {
+    rm -f "$IN_FIFO" "$RESTART_LOCK" "$INSTANCIA_FILE" 2>/dev/null
+
+    # current.log copiado aponta para o log da OUTRA pasta (caminho absoluto).
+    if [[ -L "$CURRENT_LOG" ]]; then
+        local alvo; alvo=$(readlink -f "$CURRENT_LOG" 2>/dev/null)
+        [[ "$alvo" != "$LOG_DIR"/* ]] && rm -f "$CURRENT_LOG"
+    fi
+
+    local nlogs nbkp
+    nlogs=$(find "$LOG_DIR" -maxdepth 1 -name 'server_*.log' 2>/dev/null | wc -l)
+    nbkp=$(find "$BACKUP_DIR" -maxdepth 1 -name 'saves_*.tar.gz' 2>/dev/null | wc -l)
+    if (( nlogs + nbkp > 0 )); then
+        echo ""
+        echo "  Vieram na cópia: $nlogs log(s) e $nbkp backup(s) da outra instância."
+        read -r -p "  Apagar? (senão o diagnóstico desta instância fica confuso) [S/n]: " r
+        if [[ "${r,,}" != "n" ]]; then
+            find "$LOG_DIR" -maxdepth 1 \( -name 'server_*.log' -o -name 'current.log' \) \
+                -delete 2>/dev/null
+            find "$BACKUP_DIR" -maxdepth 1 -name 'saves_*.tar.gz' -delete 2>/dev/null
+            ok "Logs e backups copiados removidos."
+        fi
+    fi
+}
+
+tratar_saves_copiados() {
+    local existentes=() d
+    for d in "${SAVE_DIRS[@]}"; do
+        [[ -d "$SERVER_DIR/$d" ]] && existentes+=("$d")
+    done
+    if (( ${#existentes[@]} == 0 )); then
+        log "Sem saves nesta pasta — o mundo nasce novo no primeiro start."
+        return
+    fi
+
+    echo ""
+    warn "Esta pasta tem saves copiados (${existentes[*]})."
+    echo -e "    ${GREEN}m${NC}) MANTER — começa como um clone do mundo da outra instância"
+    echo -e "    ${GREEN}n${NC}) NOVO MUNDO — arquiva os saves copiados em backups/ e apaga"
+    read -r -p "  Escolha [m]: " r
+    if [[ "${r,,}" == "n" ]]; then
+        mkdir -p "$BACKUP_DIR"
+        local arq="$BACKUP_DIR/saves_copiados_$(date '+%Y-%m-%d_%H-%M-%S').tar.gz"
+        log "Arquivando ${existentes[*]}..."
+        if tar -czf "$arq" -C "$SERVER_DIR" "${existentes[@]}" 2>/dev/null; then
+            for d in "${existentes[@]}"; do rm -rf "${SERVER_DIR:?}/$d"; done
+            chown "$USER_OWNER:$GROUP_OWNER" "$arq" 2>/dev/null
+            ok "Saves arquivados em $(basename "$arq") e removidos."
+        else
+            rm -f "$arq"
+            err "Falha ao arquivar — saves MANTIDOS."
+        fi
+    else
+        ok "Saves mantidos (clone do mundo)."
+    fi
+}
+
+configurar_porta_nova_instancia() {
+    echo ""
+    if [[ ! -f "$CONFIG_JSON" ]]; then
+        warn "server_config.json não existe nesta pasta."
+        warn "Copie o da outra instância e troque a porta (menu 11 → p) antes do"
+        warn "primeiro start: sem ele o jogo sobe na porta padrão e pode conflitar."
+        return
+    fi
+    if ! tem_jq; then
+        warn "jq ausente: não consigo ler/editar a porta agora."
+        warn "Depois da instalação (opção 1), use o menu 11 → p."
+        return
+    fi
+
+    local atual sug dona
+    atual=$(porta_atual)
+    dona=$(instancia_com_porta "$atual")
+    if [[ -n "$dona" ]]; then
+        warn "A porta $atual veio na cópia e pertence à instância '$dona'."
+        sug=$(sugerir_porta "$atual")
+    elif porta_em_uso_sistema "$atual"; then
+        warn "A porta $atual está em uso por outro processo."
+        sug=$(sugerir_porta "$atual")
+    else
+        log "Porta atual: $atual (livre)."
+        sug="$atual"
+    fi
+
+    until trocar_porta_interativo "$sug"; do
+        read -r -p "  Tentar outra porta? [S/n]: " r
+        [[ "${r,,}" == "n" ]] && { warn "Porta NÃO resolvida — o start vai pedir de novo."; break; }
+        sug=""
+    done
+}
+
+assistente_nova_instancia() {
+    clear
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║       NOVA INSTÂNCIA DETECTADA              ║${NC}"
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo "  Esta pasta não pertence a nenhuma instância instalada:"
+    echo -e "    ${BOLD}$SERVER_DIR${NC}"
+    echo ""
+    echo "  Instâncias já registradas nesta máquina:"
+    tabela_instancias
+    echo ""
+    echo "  Parece uma CÓPIA de outra instância. Para rodar sem conflito, ela"
+    echo "  precisa de nome, porta, serviço, logs, FIFO e lock próprios."
+    echo ""
+    read -r -p "  Configurar como NOVA instância agora? [S/n]: " r
+    [[ "${r,,}" == "n" ]] && return 1
+
+    local nome
+    while true; do
+        read -r -p "  Nome da instância (ex.: squad, solo): " nome
+        nome="${nome,,}"
+        if [[ ! "$nome" =~ ^[a-z0-9][a-z0-9-]{0,19}$ ]]; then
+            err "Use 1-20 caracteres: letras minúsculas, números e '-'."
+            continue
+        fi
+        if [[ "$nome" == "principal" ]]; then
+            err "'principal' é reservado para a instância original."
+            continue
+        fi
+        if [[ -f "$SYSTEMD_DIR/$(unit_de_instancia "$nome").service" ]]; then
+            err "Já existe uma instância '$nome'."
+            continue
+        fi
+        break
+    done
+
+    INSTANCIA="$nome"
+    aplicar_nomes_instancia
+
+    limpar_residuos_copia
+    tratar_saves_copiados
+    configurar_porta_nova_instancia
+
+    if [[ -f "$CONFIG_JSON" ]] && tem_jq; then
+        echo ""
+        trocar_nome_servidor
+    fi
+
+    if ! gravar_marcador; then
+        err "Não consegui gravar $INSTANCIA_FILE (permissão?)."
+        return 1
+    fi
+    INSTANCIA_ORIGEM="marcador"
+
+    echo ""
+    ok "Instância '$INSTANCIA' configurada → serviço $SERVICE_NAME · tmux $TMUX_SESSION"
+    echo ""
+    read -r -p "  Instalar o serviço desta instância agora (opção 1)? [S/n]: " r
+    [[ "${r,,}" != "n" ]] && acao_instalar
+    return 0
 }
 
 # ============================================================
@@ -583,7 +1189,7 @@ verificar_libs() {
 }
 
 # ============================================================
-#  SWAP / SYSCTL
+#  SWAP / SYSCTL  (globais — valem para todas as instâncias)
 # ============================================================
 config_swap() {
     local SUDO; SUDO=$(precisa_sudo)
@@ -666,7 +1272,7 @@ run_tail() {
         if [[ "$alvo" != "$atual" ]]; then
             [[ -n "${tp:-}" ]] && { kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null; }
             atual="$alvo"
-            echo -e "\n${CYAN}── seguindo $(basename "$alvo") ──${NC}\n"
+            echo -e "\n${CYAN}── [$INSTANCIA] seguindo $(basename "$alvo") ──${NC}\n"
             tail -n 200 -F "$alvo" & tp=$!
         fi
         sleep 2
@@ -695,16 +1301,16 @@ avisar_reinicio() {
         || echo "[$(date '+%F %T')] Falha ao enviar aviso pela FIFO."
 }
 
-# Modo __restart: executado pelo decay-restart.service (disparado pelo timer).
+# Modo __restart: executado pelo decay-restart[-<nome>].service (timer).
 run_restart_agendado() {
     # Impede dois reinícios simultâneos (timer + manual, ou timer duplicado).
-    exec 9>"$RESTART_LOCK"
+    abrir_lock
     if ! flock -n 9; then
-        echo "[$(date '+%F %T')] Outro reinício já está em andamento. Saindo."
+        echo "[$(date '+%F %T')] Outro reinício de '$INSTANCIA' já está em andamento. Saindo."
         exit 0
     fi
 
-    echo "[$(date '+%F %T')] Reinício programado iniciado."
+    echo "[$(date '+%F %T')] Reinício programado de '$INSTANCIA' iniciado."
 
     if ! esta_rodando; then
         echo "[$(date '+%F %T')] Servidor parado — nada a fazer."
@@ -762,9 +1368,9 @@ instalar_restart_timer() {
     # Avisos + stop (até STOP_WAIT_SYSTEMD) + backup + subida/restauração + folga.
     local timeout_min=$(( lead + STOP_WAIT_SYSTEMD / 60 + ESPERA_PRONTO_S / 60 + 10 ))
 
-    $SUDO tee "/etc/systemd/system/$RESTART_UNIT.service" >/dev/null <<EOF
+    $SUDO tee "$SYSTEMD_DIR/$RESTART_UNIT.service" >/dev/null <<EOF
 [Unit]
-Description=Decay - reinício programado (avisos + save + backup + restart)
+Description=Decay [$INSTANCIA] - reinício programado (avisos + save + backup + restart)
 
 [Service]
 Type=oneshot
@@ -772,9 +1378,9 @@ ExecStart=$SELF __restart
 TimeoutStartSec=${timeout_min}min
 EOF
 
-    $SUDO tee "/etc/systemd/system/$RESTART_UNIT.timer" >/dev/null <<EOF
+    $SUDO tee "$SYSTEMD_DIR/$RESTART_UNIT.timer" >/dev/null <<EOF
 [Unit]
-Description=Decay - reinício diário às $RESTART_HORARIO (dispara às $disparo para os avisos)
+Description=Decay [$INSTANCIA] - reinício diário às $RESTART_HORARIO (dispara às $disparo para os avisos)
 
 [Timer]
 OnCalendar=*-*-* $disparo:00
@@ -789,22 +1395,34 @@ EOF
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable --now "$RESTART_UNIT.timer" >/dev/null 2>&1
 
-    ok "Reinício diário às $RESTART_HORARIO (avisos a partir das $disparo)."
+    ok "Reinício diário de '$INSTANCIA' às $RESTART_HORARIO (avisos a partir das $disparo)."
     [[ -z "$RESTART_AVISO_CMD" ]] && \
         warn "RESTART_AVISO_CMD vazio: os jogadores NÃO serão avisados no chat."
+
+    # Outras instâncias reiniciando no mesmo horário disputam disco e CPU.
+    local f oc
+    for f in "$SYSTEMD_DIR/$RESTART_BASE".timer "$SYSTEMD_DIR/$RESTART_BASE"-*.timer; do
+        [[ -f "$f" ]] || continue
+        [[ "$(basename "$f" .timer)" == "$RESTART_UNIT" ]] && continue
+        oc=$(sed -n 's/^OnCalendar=//p' "$f" | head -n1)
+        if [[ "$oc" == "*-*-* $disparo:00" ]]; then
+            warn "$(basename "$f" .timer) dispara no MESMO horário ($disparo)."
+            warn "Escalone: mude RESTART_HORARIO no topo do script de uma delas (ex.: +30 min)."
+        fi
+    done
 }
 
 remover_restart_timer() {
     local SUDO; SUDO=$(precisa_sudo)
     $SUDO systemctl disable --now "$RESTART_UNIT.timer" 2>/dev/null
-    $SUDO rm -f "/etc/systemd/system/$RESTART_UNIT.timer" \
-                "/etc/systemd/system/$RESTART_UNIT.service"
+    $SUDO rm -f "$SYSTEMD_DIR/$RESTART_UNIT.timer" \
+                "$SYSTEMD_DIR/$RESTART_UNIT.service"
     $SUDO systemctl daemon-reload
-    ok "Reinício programado removido."
+    ok "Reinício programado de '$INSTANCIA' removido."
 }
 
 status_restart_timer() {
-    if systemctl is-enabled --quiet "$RESTART_UNIT.timer" 2>/dev/null; then
+    if [[ -n "$RESTART_UNIT" ]] && systemctl is-enabled --quiet "$RESTART_UNIT.timer" 2>/dev/null; then
         local prox
         prox=$(systemctl show -p NextElapseUSecRealtime --value "$RESTART_UNIT.timer" 2>/dev/null)
         echo -e "${GREEN}ATIVO${NC} · ${RESTART_HORARIO} · próximo disparo: ${prox:-?}"
@@ -815,6 +1433,7 @@ status_restart_timer() {
 
 acao_reinicio_programado() {
     echo ""
+    echo -e "  Instância: ${BOLD}$INSTANCIA${NC} · unit ${RESTART_UNIT}"
     echo -e "  Estado: $(status_restart_timer)"
     echo ""
     echo -e "  Config (topo do script): ${BOLD}$RESTART_HORARIO${NC}" \
@@ -835,10 +1454,10 @@ acao_reinicio_programado() {
     case "${op:-}" in
         i|I) instalar_restart_timer ;;
         t|T)
-            if [[ ! -f "/etc/systemd/system/$RESTART_UNIT.service" ]]; then
+            if [[ ! -f "$SYSTEMD_DIR/$RESTART_UNIT.service" ]]; then
                 err "Instale primeiro (opção i)."
             else
-                warn "Isto reinicia o servidor de verdade, com os avisos configurados."
+                warn "Isto reinicia '$INSTANCIA' de verdade, com os avisos configurados."
                 warn "O uptime mínimo de ${RESTART_MIN_UPTIME_H}h continua valendo."
                 read -r -p "  Confirmar? [s/N]: " r
                 if [[ "${r,,}" == "s" ]]; then
@@ -857,17 +1476,70 @@ acao_reinicio_programado() {
 # ============================================================
 #  1. INSTALAR / ATUALIZAR
 # ============================================================
+
+# MemoryMax desta instância: a fatia total dividida entre as instâncias.
+calcular_memory_max() {
+    if [[ -n "$MEMORY_MAX_MB" ]]; then
+        echo "$MEMORY_MAX_MB"; return
+    fi
+    local total n
+    total=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)
+    n=$(outras_instancias | grep -c .)
+    n=$(( n + 1 ))
+    echo $(( total * MEM_MAX_PCT_TOTAL / 100 / n ))
+}
+
+avisar_soma_memory_max() {
+    local meu="$1" total soma n d v
+    total=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)
+    soma=$meu
+    local desatualizadas=()
+    while IFS='|' read -r n d; do
+        v=$(systemctl show -p MemoryMax --value "$(unit_de_instancia "$n")" 2>/dev/null)
+        if [[ "$v" =~ ^[0-9]+$ ]]; then
+            soma=$(( soma + v / 1024 / 1024 ))
+            (( v / 1024 / 1024 > meu * 3 / 2 )) && desatualizadas+=("$n")
+        fi
+    done < <(outras_instancias)
+
+    if (( soma > total * MEM_MAX_PCT_TOTAL / 100 )); then
+        warn "Soma dos MemoryMax: ${soma} MB de ${total} MB (> ${MEM_MAX_PCT_TOTAL}%)."
+        if (( ${#desatualizadas[@]} > 0 )); then
+            warn "Unit com teto da época em que estava sozinha: ${desatualizadas[*]}."
+            warn "Rode a opção 1 no painel dela para redividir (vale no próximo reinício)."
+        fi
+    fi
+}
+
 acao_instalar() {
     local SUDO; SUDO=$(precisa_sudo)
     local estava_rodando=0
     esta_rodando && estava_rodando=1
 
+    # Nunca sobrescreve a unit de OUTRA pasta.
+    if [[ -f "$UNIT_PATH" ]]; then
+        local wd
+        wd=$(sed -n 's/^WorkingDirectory=//p' "$UNIT_PATH" | head -n1)
+        if [[ -n "$wd" && "$(readlink -f "$wd" 2>/dev/null)" != "$SERVER_DIR" ]]; then
+            err "A unit $SERVICE_NAME pertence a outra pasta: $wd"
+            err "Abortando para não sequestrar outra instância."
+            pausar; return
+        fi
+    fi
+
+    log "Instância: $INSTANCIA → $SERVICE_NAME"
     log "Diretório: $SERVER_DIR"
     log "Dono/grupo: $USER_OWNER:$GROUP_OWNER"
 
+    # Dependências e kernel são globais: a segunda instância costuma pular.
     echo ""
-    read -r -p "  Rodar apt update/upgrade + instalar dependências? [S/n]: " r
-    [[ "${r,,}" != "n" ]] && acao_dependencias
+    if [[ -n "$(outras_instancias)" ]]; then
+        read -r -p "  Rodar apt update/upgrade + dependências? (outra instância já instalou) [s/N]: " r
+        [[ "${r,,}" == "s" ]] && acao_dependencias
+    else
+        read -r -p "  Rodar apt update/upgrade + instalar dependências? [S/n]: " r
+        [[ "${r,,}" != "n" ]] && acao_dependencias
+    fi
 
     $SUDO chown -R "$USER_OWNER:$GROUP_OWNER" "$SERVER_DIR"
     chmod +x "$APP" 2>/dev/null || $SUDO chmod +x "$APP"
@@ -876,21 +1548,38 @@ acao_instalar() {
     mkdir -p "$LOG_DIR" "$BACKUP_DIR"
     chmod 755 "$LOG_DIR" "$BACKUP_DIR"
 
+    gravar_marcador || warn "Não consegui gravar $INSTANCIA_FILE."
+
     config_swap
     config_sysctl
+
+    # ── Porta ───────────────────────────────────────────────
+    local porta dona
+    porta=$(porta_atual)
+    dona=$(instancia_com_porta "$porta")
+    if [[ -n "$dona" ]]; then
+        warn "A porta $porta também está no config da instância '$dona'."
+        if ! esta_rodando; then
+            read -r -p "  Trocar a porta desta instância agora? [S/n]: " r
+            [[ "${r,,}" != "n" ]] && trocar_porta_interativo
+        else
+            warn "Pare esta instância e use o menu 11 → p para trocar."
+        fi
+    fi
 
     # ── MemoryMax dimensionado pela máquina ─────────────────
     # Sem MemoryHigh: ao ultrapassá-lo o cgroup entra em RECLAIM AGRESSIVO
     # e o kernel despeja páginas do processo para o swap — thrashing criado
-    # por configuração. MemoryMax é só um teto de segurança.
+    # por configuração. MemoryMax é só um teto de segurança, dividido entre
+    # as instâncias para que o leak de uma não derrube a outra.
     local MEM_TOTAL_MB MEM_MAX_MB
     MEM_TOTAL_MB=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)
-    MEM_MAX_MB=$(( MEM_TOTAL_MB * 85 / 100 ))
+    MEM_MAX_MB=$(calcular_memory_max)
 
     log "Instalando unit do systemd (MemoryMax=${MEM_MAX_MB}M de ${MEM_TOTAL_MB}M)..."
     $SUDO tee "$UNIT_PATH" >/dev/null <<EOF
 [Unit]
-Description=Decay Dedicated Server
+Description=Decay Dedicated Server [$INSTANCIA]
 After=network-online.target
 Wants=network-online.target
 
@@ -939,9 +1628,11 @@ EOF
 
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+    INSTANCIA_ORIGEM="unit"
 
-    ok "Unit instalada (TimeoutStopSec=${STOP_WAIT_SYSTEMD}s, wrapper ${STOP_WAIT_WRAPPER}s," \
-       "shutdown=exit $EXIT_DESLIGAR sem reinício)."
+    ok "Unit $SERVICE_NAME instalada (TimeoutStopSec=${STOP_WAIT_SYSTEMD}s," \
+       "wrapper ${STOP_WAIT_WRAPPER}s, shutdown=exit $EXIT_DESLIGAR sem reinício)."
+    avisar_soma_memory_max "$MEM_MAX_MB"
 
     echo ""
     read -r -p "  Configurar o reinício diário programado ($RESTART_HORARIO)? [S/n]: " r
@@ -950,12 +1641,21 @@ EOF
     ok "Instalação concluída."
     echo ""
     verificar_ip_publico
+    [[ "$INSTANCIA" != "principal" ]] && lembrete_firewall "$(porta_atual)"
 
     if (( estava_rodando )); then
         warn "O serviço está rodando com a unit ANTIGA."
-        warn "O novo encerramento seguro só vale depois de reiniciar."
+        warn "O novo encerramento seguro e o novo MemoryMax só valem depois de reiniciar."
         read -r -p "  Reiniciar agora (com save, backup e espera)? [s/N]: " r
-        [[ "${r,,}" == "s" ]] && reiniciar_seguro "instalação" 1
+        if [[ "${r,,}" == "s" ]]; then
+            abrir_lock
+            if flock -n 9; then
+                reiniciar_seguro "instalação" 1
+            else
+                err "Um reinício programado está em andamento. Reinicie depois."
+            fi
+            exec 9<&-
+        fi
     fi
     pausar
 }
@@ -968,6 +1668,12 @@ acao_iniciar() {
         warn "Já está rodando."
         pausar; return
     fi
+    if [[ ! -f "$UNIT_PATH" ]]; then
+        err "O serviço desta instância ($SERVICE_NAME) não está instalado. Rode a opção 1."
+        pausar; return
+    fi
+
+    preparar_inicio || { log "Cancelado."; pausar; return; }
 
     local SUDO; SUDO=$(precisa_sudo)
     local log_anterior
@@ -980,7 +1686,7 @@ acao_iniciar() {
         pausar; return
     fi
 
-    ok "Servidor iniciado."
+    ok "Servidor '$INSTANCIA' iniciado (porta $(porta_atual))."
     read -r -p "  Aguardar a restauração do mundo terminar? [S/n]: " r
     if [[ "${r,,}" != "n" ]]; then
         log "Aguardando 'Conexões LIBERADAS' (até $(( ESPERA_PRONTO_S / 60 )) min)..."
@@ -1002,7 +1708,7 @@ acao_parar() {
     local log_anterior
     log_anterior=$(readlink -f "$CURRENT_LOG" 2>/dev/null)
 
-    log "Parando... o save final pode levar até ${STOP_WAIT_WRAPPER}s. NÃO interrompa."
+    log "Parando '$INSTANCIA'... o save final pode levar até ${STOP_WAIT_WRAPPER}s. NÃO interrompa."
     local INICIO=$SECONDS
     $SUDO systemctl stop "$SERVICE_NAME"
 
@@ -1022,7 +1728,7 @@ acao_parar() {
 
 acao_reiniciar() {
     if esta_rodando; then
-        warn "Jogadores conectados serão desconectados."
+        warn "Jogadores conectados em '$INSTANCIA' serão desconectados."
         warn "O save final pode levar até ${STOP_WAIT_WRAPPER}s."
         read -r -p "  Confirmar reinício? [s/N]: " r
         [[ "${r,,}" != "s" ]] && { log "Cancelado."; pausar; return; }
@@ -1032,16 +1738,22 @@ acao_reiniciar() {
         [[ "${b,,}" == "n" ]] && com_backup=0
 
         # Mesmo lock do reinício programado: não roda os dois juntos.
-        exec 9>"$RESTART_LOCK"
+        abrir_lock
         if ! flock -n 9; then
             err "Um reinício programado está em andamento. Aguarde."
-            exec 9>&-
+            exec 9<&-
             pausar; return
         fi
 
         reiniciar_seguro "manual" "$com_backup"
-        exec 9>&-
+        exec 9<&-
     else
+        if [[ ! -f "$UNIT_PATH" ]]; then
+            err "O serviço desta instância não está instalado. Rode a opção 1."
+            pausar; return
+        fi
+        preparar_inicio || { log "Cancelado."; pausar; return; }
+
         local SUDO; SUDO=$(precisa_sudo)
         local log_anterior
         log_anterior=$(readlink -f "$CURRENT_LOG" 2>/dev/null)
@@ -1059,14 +1771,14 @@ acao_reiniciar() {
 #  5. CONSOLE + LOGS
 # ============================================================
 run_prompt() {
-    echo -e "${BOLD}Console do servidor Decay${NC}"
+    echo -e "${BOLD}Console do servidor Decay — instância ${CYAN}$INSTANCIA${NC}${BOLD} (porta $(porta_atual))${NC}"
     echo -e "Jogo:      ${GREEN}adminset Joao true${NC} · ${GREEN}players${NC}"
     echo -e "Servidor:  ${GREEN}status${NC} · ${GREEN}save${NC} · ${GREEN}say <texto>${NC}" \
             "· ${GREEN}stop [s]${NC} (reinicia) · ${GREEN}shutdown [s]${NC} (desliga)"
     echo -e "Sair do painel: ${YELLOW}Ctrl+B${NC} depois ${YELLOW}D${NC} (servidor segue rodando)."
     echo ""
     while true; do
-        read -r -p "decay> " linha || break
+        read -r -p "decay[$INSTANCIA]> " linha || break
         [[ -z "$linha" ]] && continue
         if [[ "$linha" == "sair" || "$linha" == "exit" ]]; then
             echo "Use Ctrl+B depois D para fechar o painel."
@@ -1088,7 +1800,7 @@ console_simples() {
     echo ""
     trap 'echo; return' SIGINT
     while true; do
-        read -r -p "decay> " linha || break
+        read -r -p "decay[$INSTANCIA]> " linha || break
         [[ "$linha" == "sair" || "$linha" == "exit" ]] && break
         [[ -z "$linha" ]] && continue
         enviar_comando "$linha" && echo -e "${CYAN}→ enviado:${NC} $linha" || err "Falha no envio."
@@ -1120,7 +1832,7 @@ acao_console() {
     fi
 
     if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-        read -r -p "  Sessão existente. [a]nexar ou [r]ecriar? [a]: " s
+        read -r -p "  Sessão '$TMUX_SESSION' existente. [a]nexar ou [r]ecriar? [a]: " s
         if [[ "${s,,}" == "r" ]]; then
             tmux kill-session -t "$TMUX_SESSION" 2>/dev/null
         else
@@ -1129,11 +1841,11 @@ acao_console() {
         fi
     fi
 
-    log "Abrindo console + logs. Ctrl+B depois D para desanexar."
+    log "Abrindo console + logs de '$INSTANCIA'. Ctrl+B depois D para desanexar."
     sleep 1
 
     # __tail reabre o arquivo quando o symlink current.log é repontado.
-    tmux new-session -d -s "$TMUX_SESSION" -n decay "'$SELF' __tail"
+    tmux new-session -d -s "$TMUX_SESSION" -n "decay-$INSTANCIA" "'$SELF' __tail"
     tmux split-window -v -t "$TMUX_SESSION" "'$SELF' __prompt"
     tmux resize-pane -t "$TMUX_SESSION".0 -y 70%
     tmux select-pane -t "$TMUX_SESSION".1
@@ -1160,7 +1872,7 @@ uso_cpu_total() {
     echo "$pct $steal"
 }
 
-# Taxa de rede em KB/s.
+# Taxa de rede em KB/s (máquina inteira — todas as instâncias somadas).
 rede_taxa() {
     local r1 t1 r2 t2
     read -r r1 t1 < <(awk -F'[: ]+' 'NR>2 && $2!="lo" {r+=$3; t+=$11} END{print r, t}' /proc/net/dev)
@@ -1173,10 +1885,10 @@ render_monitor() {
     echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════╗${NC}"
     echo -e "${BOLD}${CYAN}║       STATUS & MONITOR · DECAY              ║${NC}"
     echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════╝${NC}"
-    echo -e "  ${CYAN}$(date '+%F %T')${NC}  ·  $(status_curto)"
+    echo -e "  ${CYAN}$(date '+%F %T')${NC}  ·  ${BOLD}$INSTANCIA${NC}  ·  $(status_curto)"
     echo ""
 
-    echo -e "${BOLD}── Processo do jogo ─────────────────────────${NC}"
+    echo -e "${BOLD}── Processo do jogo ($INSTANCIA) ──────────────${NC}"
     local pid; pid=$(pid_do_servidor)
     if [[ -z "$pid" ]]; then
         warn "Nenhum processo do jogo em execução."
@@ -1187,6 +1899,7 @@ render_monitor() {
             warn "Processo saiu durante a leitura."
         else
             printf "  PID............: %s\n" "$pid"
+            printf "  Porta UDP......: %s\n" "$(porta_atual)"
             printf "  Uptime.........: %s\n" "${etime// /}"
             printf "  Threads........: %s\n" "$nlwp"
             printf "  CPU (processo).: %5s%%  %b\n" "$cpu" "$(barra_pct "$cpu")"
@@ -1224,6 +1937,17 @@ render_monitor() {
         fi
     fi
     printf "  Reinício diário: %b\n" "$(status_restart_timer)"
+    echo ""
+
+    echo -e "${BOLD}── Instâncias nesta máquina ─────────────────${NC}"
+    tabela_instancias rss
+    local n_rodando=0 n d
+    while IFS='|' read -r n d; do
+        systemctl is-active --quiet "$(unit_de_instancia "$n")" && (( n_rodando++ ))
+    done < <(listar_instancias)
+    if (( n_rodando > 1 && n_rodando >= $(nproc 2>/dev/null || echo 1) )); then
+        echo -e "  ${RED}$n_rodando servidores para $(nproc) núcleos: as main threads disputam CPU.${NC}"
+    fi
     echo ""
 
     echo -e "${BOLD}── Máquina ──────────────────────────────────${NC}"
@@ -1266,14 +1990,14 @@ render_monitor() {
         printf "  Pressão memória: %s\n" "$(awk '/^some/{print $2, $3}' /proc/pressure/memory)"
     fi
 
-    local d; d=$(df -h --output=used,size,pcent "$SERVER_DIR" 2>/dev/null | tail -n1)
-    if [[ -n "$d" ]]; then
-        local du ds dp; read -r du ds dp <<< "$d"
+    local d2; d2=$(df -h --output=used,size,pcent "$SERVER_DIR" 2>/dev/null | tail -n1)
+    if [[ -n "$d2" ]]; then
+        local du ds dp; read -r du ds dp <<< "$d2"
         printf "  Disco..........: %s / %s (%s)  %b\n" "$du" "$ds" "$dp" "$(barra_pct "${dp%\%}")"
     fi
-    printf "  Logs...........: %s\n" "$(du -sh "$LOG_DIR" 2>/dev/null | cut -f1 || echo '?')"
-    printf "  Backups........: %s\n" "$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1 || echo '?')"
-    printf "  Rede...........: %s\n" "$(rede_taxa)"
+    printf "  Logs (esta)....: %s\n" "$(du -sh "$LOG_DIR" 2>/dev/null | cut -f1 || echo '?')"
+    printf "  Backups (esta).: %s\n" "$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1 || echo '?')"
+    printf "  Rede (máquina).: %s\n" "$(rede_taxa)"
 
     # Descartes de UDP por buffer cheio: o que importa é se está SUBINDO.
     local rcvbuf
@@ -1335,6 +2059,7 @@ acao_diagnostico() {
     echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════╗${NC}"
     echo -e "${BOLD}${CYAN}║          DIAGNÓSTICO · DECAY                ║${NC}"
     echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════╝${NC}"
+    echo -e "  Instância: ${BOLD}$INSTANCIA${NC} ($SERVICE_NAME) · $SERVER_DIR"
 
     # ── Arquivos de save ────────────────────────────────────
     echo -e "\n${BOLD}── Arquivos de save ─────────────────────────${NC}"
@@ -1405,7 +2130,7 @@ acao_diagnostico() {
         "$( (( ${kills:-0} > 0 )) && echo "$RED" || echo "$GREEN")"
     local ooms
     ooms=$(dmesg -T 2>/dev/null | grep -c "Killed process.*$APP_NAME")
-    linha_diag "OOM kills (desde o boot)" "${ooms:-0}" \
+    linha_diag "OOM kills (todas as instâncias)" "${ooms:-0}" \
         "$( (( ${ooms:-0} > 0 )) && echo "$RED" || echo "$GREEN")"
 
     local rest_ok rest_falha
@@ -1421,6 +2146,8 @@ acao_diagnostico() {
         echo -e "\n${BOLD}── Config efetiva (server_config.json) ──────${NC}"
         linha_diag "Nome / Porta / Time" \
             "$(cfg .NomeDoServidor) · $(cfg .Porta) · $(cfg .LimiteDeTime)"
+        local dona; dona=$(instancia_com_porta "$(porta_atual)")
+        [[ -n "$dona" ]] && linha_diag "Porta repetida" "mesma da instância '$dona'" "$RED"
         linha_diag "MaxPlayers" "$(cfg .MaxPlayers)"
         linha_diag "SendRate / TargetFrameRate" \
             "$(cfg .Rede.SendRate) / $(cfg .Rede.TargetFrameRate)"
@@ -1626,6 +2353,7 @@ acao_ambiente() {
     echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════╗${NC}"
     echo -e "${BOLD}${CYAN}║        VERIFICAÇÃO DE AMBIENTE              ║${NC}"
     echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════╝${NC}"
+    echo -e "  Instância: ${BOLD}$INSTANCIA${NC} ($SERVICE_NAME)"
 
     echo -e "\n${BOLD}── Executável ───────────────────────────────${NC}"
     if [[ -f "$APP" ]]; then
@@ -1640,17 +2368,21 @@ acao_ambiente() {
     echo -e "\n${BOLD}── Rede ─────────────────────────────────────${NC}"
     verificar_ip_publico
 
-    local porta; porta=$(cfg .Porta); porta="${porta:-3000}"
-    if ss -uanl 2>/dev/null | grep -q ":$porta"; then
+    local porta; porta=$(porta_atual)
+    if esta_rodando && porta_em_uso_sistema "$porta"; then
         ok "Porta UDP $porta está aberta pelo processo."
+    elif porta_em_uso_sistema "$porta"; then
+        err "UDP $porta está ocupada por OUTRO processo — esta instância não vai subir."
     else
         warn "Nada escutando em UDP $porta (servidor parado?)."
     fi
+    local dona; dona=$(instancia_com_porta "$porta")
+    [[ -n "$dona" ]] && linha_diag "Porta repetida" "a instância '$dona' usa a mesma $porta" "$RED"
 
     # Buffer CONCEDIDO x pedido: se diferentes, o processo subiu antes do
     # sysctl e precisa de restart.
     local rb pedido
-    rb=$(ss -uanm 2>/dev/null | grep -A1 ":$porta" | grep -oP 'rb\K[0-9]+' | head -1)
+    rb=$(ss -uanm 2>/dev/null | grep -A1 ":$porta\b" | grep -oP 'rb\K[0-9]+' | head -1)
     pedido=$(cfg .Rede.KcpRecvBufferSize)
     if [[ -n "${rb:-}" ]]; then
         linha_diag "Buffer recv PEDIDO" "${pedido:-?} bytes"
@@ -1699,8 +2431,11 @@ acao_ambiente() {
             "$(systemctl show -p MemoryMax --value "$SERVICE_NAME" 2>/dev/null)"
         linha_diag "Reinício diário" "$(status_restart_timer)"
     else
-        err "Unit não instalada. Rode a opção 1."
+        err "Unit $SERVICE_NAME não instalada. Rode a opção 1."
     fi
+
+    echo -e "\n${BOLD}── Instâncias nesta máquina ─────────────────${NC}"
+    tabela_instancias
 
     echo -e "\n${BOLD}── Reboot automático ────────────────────────${NC}"
     if [[ -f /etc/apt/apt.conf.d/99-decay-no-reboot ]]; then
@@ -1713,18 +2448,105 @@ acao_ambiente() {
 }
 
 # ============================================================
+#  11. INSTÂNCIAS
+# ============================================================
+remover_registro_instancia() {
+    local SUDO; SUDO=$(precisa_sudo)
+    warn "Remove o serviço e o timer de '$INSTANCIA'. NÃO apaga arquivos, saves nem logs."
+    [[ "$INSTANCIA" == "principal" ]] && \
+        warn "Esta é a instância PRINCIPAL: outra pasta poderá assumir o nome depois."
+    read -r -p "  Digite o nome da instância para confirmar: " conf
+    [[ "$conf" == "$INSTANCIA" ]] || { log "Cancelado."; return 1; }
+
+    if esta_rodando; then
+        log "Parando com save..."
+        $SUDO systemctl stop "$SERVICE_NAME"
+        esta_rodando && { err "Não parou. Abortando."; return 1; }
+    fi
+    $SUDO systemctl disable --now "$RESTART_UNIT.timer" 2>/dev/null
+    $SUDO systemctl disable "$SERVICE_NAME" 2>/dev/null
+    $SUDO rm -f "$UNIT_PATH" "$SYSTEMD_DIR/$RESTART_UNIT.timer" "$SYSTEMD_DIR/$RESTART_UNIT.service"
+    $SUDO systemctl daemon-reload
+    tmux kill-session -t "$TMUX_SESSION" 2>/dev/null
+    rm -f "$INSTANCIA_FILE"
+    ok "Instância '$INSTANCIA' removida. Os arquivos continuam em $SERVER_DIR."
+    return 0
+}
+
+acao_instancias() {
+    clear
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║       INSTÂNCIAS NESTA MÁQUINA              ║${NC}"
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════╝${NC}"
+    echo ""
+    tabela_instancias rss
+    echo ""
+    echo -e "  Esta pasta: ${BOLD}$INSTANCIA${NC} · serviço $SERVICE_NAME · tmux $TMUX_SESSION"
+    echo -e "              porta UDP ${BOLD}$(porta_atual)${NC} · nome \"$(cfg .NomeDoServidor)\""
+    [[ -f "$UNIT_PATH" ]] || warn "Serviço desta instância ainda não instalado (opção 1)."
+    echo ""
+    echo -e "  ${CYAN}Nova instância: copie a pasta inteira (cp -a origem destino) e rode${NC}"
+    echo -e "  ${CYAN}o decayhub.sh da cópia — o assistente configura o resto.${NC}"
+    echo ""
+    echo -e "    ${GREEN}p${NC}) trocar a porta desta instância"
+    echo -e "    ${GREEN}n${NC}) trocar o NomeDoServidor desta instância"
+    echo -e "    ${GREEN}x${NC}) parar OUTRA instância (com save)"
+    echo -e "    ${GREEN}r${NC}) remover o registro desta instância (unit + timer; mantém arquivos)"
+    read -r -p "  Escolha [voltar]: " op
+    case "${op:-}" in
+        p|P) trocar_porta_interativo ;;
+        n|N) trocar_nome_servidor ;;
+        x|X)
+            local alvo n d achou=""
+            read -r -p "  Nome da instância a parar: " alvo
+            while IFS='|' read -r n d; do
+                [[ "$n" == "$alvo" ]] && achou="$d"
+            done < <(outras_instancias)
+            if [[ -z "$achou" ]]; then
+                err "Instância '$alvo' não encontrada (ou é esta)."
+            elif ! systemctl is-active --quiet "$(unit_de_instancia "$alvo")"; then
+                warn "'$alvo' já está parada."
+            else
+                parar_instancia_externa "$alvo" "$achou"
+            fi ;;
+        r|R)
+            if remover_registro_instancia; then
+                pausar
+                exit 0
+            fi ;;
+    esac
+    pausar
+}
+
+# ============================================================
 #  MENU
 # ============================================================
 menu() {
+    if [[ -z "$INSTANCIA" ]]; then
+        if ! assistente_nova_instancia; then
+            echo ""
+            warn "Sem instância configurada, este painel entraria em conflito com a outra."
+            echo "Saindo."
+            exit 1
+        fi
+    elif [[ "$INSTANCIA_ORIGEM" == "unit" ]]; then
+        # Mantém o marcador em dia (silencioso).
+        local m=""
+        [[ -f "$INSTANCIA_FILE" ]] && m=$(sed -n 's/^NOME=//p' "$INSTANCIA_FILE" | head -n1)
+        [[ "$m" != "$INSTANCIA" ]] && gravar_marcador
+    fi
+
     while true; do
         clear
         echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════╗${NC}"
         echo -e "${BOLD}${CYAN}║         DECAY · PAINEL DO SERVIDOR          ║${NC}"
         echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════╝${NC}"
         echo -e "  ${SERVER_DIR}"
+        echo -e "  Instância: ${BOLD}$INSTANCIA${NC} ($SERVICE_NAME) · porta UDP ${BOLD}$(porta_atual)${NC}"
         echo -e "  Estado: $(status_curto)"
         esta_rodando && resumo_recursos
         echo -e "  Reinício diário: $(status_restart_timer)"
+        resumo_outras_instancias
         echo ""
         echo "  1) Instalar / atualizar (apt, permissões, swap, sysctl, unit)"
         echo "  2) Iniciar servidor"
@@ -1736,6 +2558,7 @@ menu() {
         echo -e "  8) Diagnóstico ${CYAN}(saúde do save e da rede)${NC}"
         echo -e "  9) Verificar ambiente ${CYAN}(IP, libs, buffers, relógio)${NC}"
         echo -e " 10) Reinício programado ${CYAN}(diário, com avisos)${NC}"
+        echo -e " 11) Instâncias ${CYAN}(porta, nome, outras instâncias)${NC}"
         echo "  0) Sair (servidor continua rodando)"
         echo ""
         read -r -p "  Escolha: " opt
@@ -1751,6 +2574,7 @@ menu() {
             8)  acao_diagnostico ;;
             9)  acao_ambiente ;;
             10) acao_reinicio_programado ;;
+            11) acao_instancias ;;
             0)  echo "Saindo. O servidor continua em segundo plano."; exit 0 ;;
             *)  warn "Opção inválida."; sleep 1 ;;
         esac
@@ -1758,6 +2582,17 @@ menu() {
 }
 
 # ============================================================
+resolver_instancia
+[[ -n "$INSTANCIA" ]] && aplicar_nomes_instancia
+
+case "${1:-}" in
+    __run|__prompt|__tail|__restart)
+        if [[ -z "$INSTANCIA" ]]; then
+            echo "Instância não identificada para $SERVER_DIR (rode o painel nesta pasta)." >&2
+            exit 1
+        fi ;;
+esac
+
 case "${1:-}" in
     __run)      run_launcher ;;
     __prompt)   run_prompt ;;
