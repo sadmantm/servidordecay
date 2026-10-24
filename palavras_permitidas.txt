@@ -152,4 +152,9 @@ sugestao
 sexta
 seta
 zero
+base
+torreta
+time
+dupla
+
 ====
